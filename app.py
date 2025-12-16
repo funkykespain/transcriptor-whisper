@@ -14,7 +14,7 @@ from pydub import AudioSegment, silence
 API_URL = os.getenv("WHISPER_URL")
 USUARIO = os.getenv("WHISPER_USER")
 CONTRASENA = os.getenv("WHISPER_PASS")
-# Nueva variable para proteger el frontend
+# Variable para proteger el frontend
 ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD")
 
 MIN_SILENCE_LEN = 2000 
@@ -96,7 +96,7 @@ st.markdown("""
 Esta herramienta automatizada permite generar la transcripción de un examen oral.
 El sistema procesará el audio para:
 1.  **Detectar intervenciones:** Separar automáticamente los turnos de palabra basándose en los silencios.
-2.  **Identificar el idioma:** Distinguir entre Español y la Lengua B (Inglés, Francés, Italiano, Alemán, etc.).
+2.  **Identificar el idioma:** Distinguir entre Español y la Lengua B (Inglés, Francés, Alemán, Italiano, etc.).
 3.  **Generar acta:** Crear un archivo de texto con los códigos de tiempo exactos (MM:SS).
 """)
 
@@ -117,7 +117,7 @@ if ACCESS_PASSWORD:
         st.error("Clave incorrecta")
 else:
     # Si no hay variable de entorno configurada, se permite el paso (modo abierto)
-    st.warning("⚠️ Modo sin protección (Variable ACCESS_PASSWORD no configurada)")
+    st.warning("⚠️ Modo sin protección (Variable ACCESS_PASSWORD no configurada en el servidor)")
     acceso_concedido = True
 
 # --- SIDEBAR DE ESTADO ---
@@ -138,11 +138,12 @@ if acceso_concedido:
         if st.button("🚀 Iniciar Procesamiento del Examen", type="primary"):
             
             # 1. Cargar Audio
-            with st.status("Analizando archivo de audio...", expanded=True) as status:
+            with st.status("Iniciando sistema...", expanded=True) as status:
+                st.markdown("**ℹ️ Nota:** Para **CANCELAR** el proceso en cualquier momento, pulse el botón **Stop** (🛑) en la esquina superior derecha o recargue la página.")
+                
                 st.write("📥 Leyendo metadatos y convirtiendo formato...")
                 try:
                     audio = AudioSegment.from_file(uploaded_file)
-                    # Formato MM:SS para la duración total
                     duracion_fmt = formatear_tiempo(len(audio))
                     st.write(f"✅ Audio cargado correctamente. Duración total: **{duracion_fmt}**")
                 except Exception as e:
