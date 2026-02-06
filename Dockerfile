@@ -1,7 +1,5 @@
-# Cambia la versión base aquí
 FROM python:3.11-slim
 
-# El resto se mantiene igual...
 RUN apt-get update && \
     apt-get install -y ffmpeg && \
     rm -rf /var/lib/apt/lists/*
