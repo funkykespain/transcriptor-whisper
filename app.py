@@ -1,48 +1,54 @@
 import streamlit as st
 import os
 import io
-import requests
-import time
-from collections import Counter
-from requests.auth import HTTPBasicAuth
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import base64
+import json
+import re
+import numpy as np
+import matplotlib.pyplot as plt
 from pydub import AudioSegment, silence
+from openai import OpenAI
+from dotenv import load_dotenv
 
-# ================= CONFIGURACIÓN =================
-# Lectura de variables de entorno
-API_URL = os.getenv("WHISPER_URL")
-USUARIO = os.getenv("WHISPER_USER")
-CONTRASENA = os.getenv("WHISPER_PASS")
-# Variable para proteger el frontend
+# ================= CONFIGURACIÓN INICIAL =================
+load_dotenv()
+
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+BASE_URL = os.getenv("OPENROUTER_BASE_URL")
+MODEL_NAME = os.getenv("OPENROUTER_MODEL")
 ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD")
 
-MIN_SILENCE_LEN = 2000 
-SILENCE_THRESH_OFFSET = -16 
-KEEP_SILENCE = 500
-MAX_RETRIES = 3
-RETRY_DELAY = 5
-MAX_CONSECUTIVE_ERRORS = 3
+# ================= CONFIGURACIÓN DE IDIOMAS =================
+MAPA_ISO_IDIOMAS = {
+    'HR': 'CROATA', 'HY': 'ARMENIO', 'KO': 'COREANO', 'EN': 'INGLÉS',
+    'FR': 'FRANCÉS', 'IT': 'ITALIANO', 'DE': 'ALEMÁN', 'PT': 'PORTUGUÉS',
+    'NL': 'NEERLANDÉS', 'SV': 'SUECO', 'DA': 'DANÉS', 'FI': 'FINLANDÉS',
+    'NO': 'NORUEGO', 'IS': 'ISLANDÉS', 'RU': 'RUSO', 'PL': 'POLACO',
+    'RO': 'RUMANO', 'CS': 'CHECO', 'SK': 'ESLOVACO', 'HU': 'HÚNGARO',
+    'BG': 'BÚLGARO', 'SR': 'SERBIO', 'UK': 'UCRANIANO', 'EL': 'GRIEGO',
+    'SL': 'ESLOVENO', 'ET': 'ESTONIO', 'LV': 'LETÓN', 'LT': 'LITUANO',
+    'ZH': 'CHINO', 'JA': 'JAPONÉS', 'AR': 'ÁRABE', 'HI': 'HINDI',
+    'TR': 'TURCO', 'HE': 'HEBREO', 'VI': 'VIETNAMITA', 'TH': 'TAILANDÉS',
+    'ID': 'INDONESIO', 'FA': 'PERSA', 'CA': 'CATALÁN', 'GL': 'GALLEGO',
+    'EU': 'EUSKERA'
+}
 
-# ================= FUNCIONES =================
+# ================= HERRAMIENTAS Y FUNCIONES =================
 
-def get_session():
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retries)
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
-    session.auth = HTTPBasicAuth(USUARIO, CONTRASENA)
-    return session
+def get_ai_client():
+    if not API_KEY: return None
+    return OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-def verificar_servidor():
-    if not API_URL or not USUARIO or not CONTRASENA:
-        return False, "⚠️ Faltan credenciales del backend."
-    try:
-        requests.post(API_URL, auth=HTTPBasicAuth(USUARIO, CONTRASENA), timeout=10)
-        return True, "✅ Servidor de Transcripción Online"
-    except Exception as e:
-        return False, f"❌ Error de conexión con Whisper: {str(e)}"
+def normalizar_audio(audio: AudioSegment) -> AudioSegment:
+    audio = audio.set_channels(1)
+    audio = audio.set_frame_rate(16000)
+    audio = audio.high_pass_filter(200) 
+    return audio
+
+def audio_to_base64(audio_segment: AudioSegment) -> str:
+    buffer = io.BytesIO()
+    audio_segment.export(buffer, format="mp3", bitrate="32k")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 def formatear_tiempo(ms):
     seconds = int(ms / 1000)
@@ -50,206 +56,284 @@ def formatear_tiempo(ms):
     seconds = seconds % 60
     return f"{minutes:02d}:{seconds:02d}"
 
-def transcribir_chunk(session, chunk_audio, filename_ref, language=None, status_placeholder=None):
-    buffer = io.BytesIO()
-    # Exportamos a 32k para optimizar la subida a la red interna/externa
-    chunk_audio.export(buffer, format="mp3", bitrate="32k") 
-    buffer.seek(0)
-    file_bytes = buffer.getvalue()
+def generar_onda_visual(audio_segment):
+    """Genera una imagen simple de la onda de audio para referencia visual."""
+    # Convertimos a array de numpy
+    samples = np.array(audio_segment.get_array_of_samples())
     
-    params = {'task': 'transcribe', 'output': 'json'}
-    if language:
-        params['language'] = language
+    # Si es estéreo (aunque normalizamos antes), tomamos un canal
+    if audio_segment.channels == 2:
+        samples = samples[::2]
+        
+    # Submuestreo para que el gráfico no pese demasiado (1 de cada 100 muestras)
+    samples = samples[::100]
 
-    for intento in range(1, MAX_RETRIES + 1):
-        try:
-            buffer_envio = io.BytesIO(file_bytes)
-            files = {'audio_file': (f'{filename_ref}.mp3', buffer_envio, 'audio/mpeg')}
+    fig, ax = plt.subplots(figsize=(10, 1.5)) # Ancho y bajito
+    ax.plot(samples, color='#1E88E5', alpha=0.6, linewidth=0.5)
+    ax.axis('off') # Quitamos ejes y bordes
+    fig.patch.set_alpha(0) # Fondo transparente
+    
+    # Convertimos plot a imagen para streamlit
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+# ================= LÓGICA DE AUTO-CALIBRACIÓN =================
+
+def autocalibrar_audio(uploaded_file):
+    try:
+        audio = AudioSegment.from_file(uploaded_file)
+        peak = audio.max_dBFS
+        avg = audio.dBFS
+        
+        # Fórmula: Umbral = Promedio - 10dB (Margen seguridad)
+        target_threshold = avg - 10 
+        suggested_slider = target_threshold - peak
+        suggested_slider = max(-60, min(-10, int(suggested_slider)))
+        
+        return suggested_slider, peak, avg
+    except:
+        return -28, 0, 0
+
+# ================= LÓGICA DE IA (DETECTAR Y TRANSCRIBIR) =================
+
+def crear_collage_audio(audio_total: AudioSegment, chunks_ranges: list) -> AudioSegment:
+    collage = AudioSegment.empty()
+    if not chunks_ranges: return audio_total[:60000]
+
+    num_muestras = min(len(chunks_ranges), 6)
+    step = len(chunks_ranges) // num_muestras if num_muestras > 0 else 1
+    
+    for i in range(0, len(chunks_ranges), step):
+        start, end = chunks_ranges[i]
+        duracion = end - start
+        if duracion > 8000:
+            mid = start + (duracion // 2)
+            clip = audio_total[mid - 3000 : mid + 3000] 
+        else:
+            clip = audio_total[start:end]
+        collage += clip
+        if len(collage) > 50000: break
             
-            response = session.post(API_URL, files=files, params=params, timeout=300)
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code in [502, 503, 504]:
-                if status_placeholder:
-                    status_placeholder.warning(f"El servidor está procesando una carga alta. Reintentando {intento}/{MAX_RETRIES}...")
-                time.sleep(RETRY_DELAY)
-                continue
-            else:
-                raise Exception(f"API Error: {response.status_code}")
-                
-        except Exception as e:
-            if intento == MAX_RETRIES:
-                raise e
-            time.sleep(RETRY_DELAY)
+    return normalizar_audio(collage)
 
-    raise Exception("Max retries")
+def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
+    b64_audio = audio_to_base64(audio_collage)
+    prompt_sistema = "Eres un lingüista experto. Identifica la LENGUA EXTRANJERA (no Español) en el audio. Responde SOLO con el código ISO 639-1 (2 letras)."
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt_sistema},
+                {
+                    "role": "user", 
+                    "content": [{"type": "text", "text": "Código ISO:"},
+                                {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}]
+                }
+            ],
+            temperature=0, max_tokens=10
+        )
+        raw_text = response.choices[0].message.content.strip().upper()
+        patron_idiomas = r'\b(' + '|'.join(MAPA_ISO_IDIOMAS.keys()) + r')\b'
+        match = re.search(patron_idiomas, raw_text)
+        if match:
+            iso_code = match.group(1)
+            return MAPA_ISO_IDIOMAS.get(iso_code, iso_code), iso_code
+        else: return "IDIOMA_B", "XX"
+    except: return "DESCONOCIDO", "XX"
 
-# ================= INTERFAZ GRÁFICA (STREAMLIT) =================
+def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str) -> dict:
+    b64_audio = audio_to_base64(normalizar_audio(segment_audio))
+    prompt_sistema = f"""
+    Eres un PERITO TRANSCRIPTOR FORENSE. 
+    Contexto: Examen oral. Idiomas: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
+    INSTRUCCIONES:
+    1. Transcribe LITERALMENTE lo que dice el ALUMNO.
+    2. Si solo hay ruido, silencio o respiración, devuelve texto vacío.
+    3. NO escribas la palabra 'JSON' ni repitas instrucciones.
+    4. Formato JSON estricto.
+    Output: {{"idioma": "ES" o "{lengua_b_iso}", "texto": "..."}}
+    """
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt_sistema},
+                {
+                    "role": "user", 
+                    "content": [{"type": "text", "text": "Analiza y transcribe:"},
+                                {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}]
+                }
+            ],
+            response_format={"type": "json_object"}, temperature=0
+        )
+        content = json.loads(response.choices[0].message.content)
+        resultado = content[0] if isinstance(content, list) and content else content
+        
+        texto_limpio = resultado.get("texto", "").strip()
+        if texto_limpio in ["JSON", "json", "JSON:", "undefined"] or not texto_limpio:
+            return {"idioma": "??", "texto": ""}
 
-st.set_page_config(page_title="Herramienta de Transcripción - Interpretación Bilateral", page_icon="🎓")
+        return resultado
+    except Exception as e: return {"idioma": "ERROR", "texto": f"[Error: {str(e)}]"}
 
+# ================= INTERFAZ GRÁFICA (UI/UX ACADÉMICA) =================
+
+st.set_page_config(page_title="Transcriptor Bilateral", page_icon="🎓", layout="wide")
+
+# --- GESTIÓN DE ESTADO ---
+if 'umbral_db' not in st.session_state: st.session_state['umbral_db'] = -28
+if 'min_silence_ms' not in st.session_state: st.session_state['min_silence_ms'] = 2000
+if 'file_id' not in st.session_state: st.session_state['file_id'] = None
+if 'calibrado' not in st.session_state: st.session_state['calibrado'] = False
+if 'waveform_img' not in st.session_state: st.session_state['waveform_img'] = None
+
+# --- CABECERA PRINCIPAL ---
 st.title("🎓 Transcripción de Exámenes")
-st.subheader("Asignatura: Interpretación Bilateral")
-
 st.markdown("""
-Esta herramienta automatizada permite generar la transcripción de un examen oral.
-El sistema procesará el audio para:
-1.  **Detectar intervenciones:** Separar automáticamente los turnos de palabra basándose en los silencios.
-2.  **Identificar el idioma:** Distinguir entre Español y la Lengua B (Inglés, Francés, Alemán, Italiano, etc.).
-3.  **Generar acta:** Crear un archivo de texto con los códigos de tiempo exactos (MM:SS).
+**Asignatura: Interpretación Bilateral** Esta herramienta automatiza la creación del acta de examen.  
+1. **Sube el archivo de audio** del alumno.
+2. El sistema **detecta automáticamente** el segundo idioma.
+3. Se genera una **transcripción literal** (sin correcciones gramaticales) para su evaluación.
 """)
-
 st.divider()
 
-# --- VERIFICACIÓN DE SEGURIDAD (ACCESO PROFESOR) ---
-acceso_concedido = False
-
+# --- LOGIN ---
 if ACCESS_PASSWORD:
-    col1, col2 = st.columns([2, 3])
-    with col1:
-        password_input = st.text_input("🔑 Clave de Acceso Docente", type="password", help="Introduce la contraseña para habilitar la transcripción.")
+    pwd = st.sidebar.text_input("🔑 Clave Docente", type="password")
+    if pwd != ACCESS_PASSWORD:
+        st.warning("Introduce la clave para acceder a la herramienta.")
+        st.stop()
+
+# --- SIDEBAR LIMPIO ---
+with st.sidebar:
+    st.header("⚙️ Configuración")
     
-    if password_input == ACCESS_PASSWORD:
-        st.success("Acceso autorizado")
-        acceso_concedido = True
-    elif password_input:
-        st.error("Clave incorrecta")
-else:
-    # Si no hay variable de entorno configurada, se permite el paso (modo abierto)
-    st.warning("⚠️ Modo sin protección (Variable ACCESS_PASSWORD no configurada en el servidor)")
-    acceso_concedido = True
+    mostrar_ajustes = st.checkbox("Ajustes manuales para ajuste fino", value=False)
+    
+    if mostrar_ajustes:
+        st.info("Solo modifica esto si la transcripción corta palabras o incluye ruido.")
+        
+        # Slider de dB
+        umbral_db_slider = st.slider(
+            "Sensibilidad (dB)", -60, -10, st.session_state['umbral_db'], key='slider_db',
+            help="Define qué volumen se considera 'Silencio'.\n- Más a la izquierda (-60): Detecta susurros (cuidado con el ruido).\n- Más a la derecha (-10): Ignora ruidos (cuidado con cortar voz)."
+        )
+        
+        # Input de Segundos (Convertimos a ms para el código)
+        silencio_sec_default = st.session_state['min_silence_ms'] / 1000
+        min_silence_sec = st.number_input(
+            "Silencio Mínimo (s)", 
+            min_value=0.5, max_value=5.0, 
+            value=silencio_sec_default, step=0.5,
+            help="Tiempo mínimo de pausa para considerar que ha terminado una frase.\n- Recomendado: 2.0 segundos."
+        )
+        
+        # Guardamos conversión
+        st.session_state['umbral_db'] = umbral_db_slider
+        st.session_state['min_silence_ms'] = int(min_silence_sec * 1000)
+    else:
+        st.success("✅ Configuración Automática Activa")
 
-# --- SIDEBAR DE ESTADO ---
-st.sidebar.header("Estado del Sistema")
-server_ok, msg = verificar_servidor()
-if server_ok:
-    st.sidebar.success(msg)
-else:
-    st.sidebar.error(msg)
-    st.stop() # Detiene la app si no hay conexión con el backend
+client = get_ai_client()
+if not client: st.error("Error: API KEY no configurada"); st.stop()
 
-# --- ÁREA DE TRABAJO (Solo si hay acceso) ---
-if acceso_concedido:
-    uploaded_file = st.file_uploader("Seleccione el archivo de audio del examen (MP3, M4A, OGG, WAV)", type=['mp3', 'm4a', 'wav', 'ogg', 'flac'])
+# --- ZONA DE CARGA ---
+uploaded_file = st.file_uploader("📂 Selecciona el archivo de audio (MP3, M4A, AAC, WAV)", type=['mp3', 'm4a', 'wav', 'aac'])
 
-    if uploaded_file is not None:
-        # Botón principal
-        if st.button("🚀 Iniciar Procesamiento del Examen", type="primary"):
+if uploaded_file:
+    # Auto-calibración al cambiar archivo
+    file_id_actual = uploaded_file.name + str(uploaded_file.size)
+    if st.session_state['file_id'] != file_id_actual:
+        with st.spinner("🔄 Analizando calidad del audio..."):
+            nuevo_umbral, _, _ = autocalibrar_audio(uploaded_file)
+            st.session_state['umbral_db'] = nuevo_umbral
+            st.session_state['min_silence_ms'] = 2000
+            st.session_state['file_id'] = file_id_actual
+            st.session_state['calibrado'] = True
             
-            # 1. Cargar Audio
-            with st.status("Iniciando sistema...", expanded=True) as status:
-                st.markdown("**ℹ️ Nota:** Para **CANCELAR** el proceso en cualquier momento, pulse el botón **Stop** (🛑) en la esquina superior derecha o recargue la página.")
-                
-                st.write("📥 Leyendo metadatos y convirtiendo formato...")
-                try:
-                    audio = AudioSegment.from_file(uploaded_file)
-                    duracion_fmt = formatear_tiempo(len(audio))
-                    st.write(f"✅ Audio cargado correctamente. Duración total: **{duracion_fmt}**")
-                except Exception as e:
-                    status.update(label="Error en el formato de audio", state="error")
-                    st.error(f"El archivo está dañado o el formato no es compatible: {e}")
-                    st.stop()
-
-                # 2. Detectar Silencios
-                st.write("✂️ Segmentando intervenciones por pausas...")
-                silence_thresh = audio.dBFS + SILENCE_THRESH_OFFSET
-                chunks_ranges = silence.detect_nonsilent(
-                    audio,
-                    min_silence_len=MIN_SILENCE_LEN,
-                    silence_thresh=silence_thresh,
-                    seek_step=100
-                )
-                
-                segmentos = []
-                for i, (start, end) in enumerate(chunks_ranges):
-                    start_adj = max(0, start - KEEP_SILENCE)
-                    end_adj = min(len(audio), end + KEEP_SILENCE)
-                    segmentos.append({
-                        "id": i,
-                        "start": start,
-                        "audio": audio[start_adj:end_adj],
-                        "text": "",
-                        "lang": "",
-                        "error": False
-                    })
-                
-                st.write(f"✅ Se han detectado **{len(segmentos)} intervenciones** distintas.")
-                status.update(label="Transcribiendo intervenciones...", state="running")
-
-                # 3. Transcribir (Pasada 1)
-                session = get_session()
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                consecutive_errors = 0
-                
-                for i, seg in enumerate(segmentos):
-                    status_text.caption(f"Procesando intervención {i+1} de {len(segmentos)}...")
-                    try:
-                        res = transcribir_chunk(session, seg["audio"], f"chunk_{i}", status_placeholder=st)
-                        seg["text"] = res.get("text", "").strip()
-                        seg["lang"] = res.get("language", "unknown")
-                        consecutive_errors = 0
-                    except Exception as e:
-                        seg["error"] = True
-                        seg["text"] = "[Error de conexión con el servidor]"
-                        consecutive_errors += 1
-                    
-                    progress_bar.progress((i + 1) / len(segmentos))
-                    
-                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        st.error("⛔ Se ha perdido la conexión con el servidor de transcripción. Proceso abortado.")
-                        break
-                
-                # 4. Análisis y Corrección
-                status.update(label="Verificando idiomas detectados...", state="running")
-                valid_langs = [s["lang"] for s in segmentos if not s["error"] and s["lang"] not in ["unknown", "nn"]]
-                segundo_idioma = None
-                
-                if valid_langs:
-                    idiomas_no_es = [l for l in valid_langs if l != 'es']
-                    if idiomas_no_es:
-                        segundo_idioma = Counter(idiomas_no_es).most_common(1)[0][0]
-                        st.markdown(f"🎯 Lengua B detectada: **{segundo_idioma.upper()}**")
-                
-                # 5. Pasada 2 (Corrección)
-                if segundo_idioma:
-                    corregir = [s for s in segmentos if not s["error"] and s["lang"] != 'es' and s["lang"] != segundo_idioma]
-                    if corregir:
-                        st.write(f"🛠 Refinando {len(corregir)} intervenciones...")
-                        prog_corr = st.progress(0)
-                        for j, seg in enumerate(corregir):
-                            try:
-                                res = transcribir_chunk(session, seg["audio"], f"fix_{seg['id']}", language=segundo_idioma)
-                                seg["text"] = res.get("text", "").strip()
-                                seg["lang"] = segundo_idioma
-                            except:
-                                pass
-                            prog_corr.progress((j+1)/len(corregir))
-                
-                status.update(label="¡Proceso finalizado con éxito!", state="complete", expanded=False)
-
-            # 6. Generar Resultado
-            output_io = io.StringIO()
-            output_io.write(f"Examen: {uploaded_file.name}\n")
-            output_io.write(f"Lengua B detectada: {segundo_idioma.upper() if segundo_idioma else 'No determinada'}\n")
-            output_io.write("="*60 + "\n\n")
+            # Generamos la onda visual UNA vez y la guardamos
+            uploaded_file.seek(0)
+            audio_temp = AudioSegment.from_file(uploaded_file)
+            st.session_state['waveform_img'] = generar_onda_visual(audio_temp)
             
-            for seg in segmentos:
-                t = formatear_tiempo(seg["start"])
-                idioma_display = "🇪🇸 ES" if seg['lang'] == 'es' else f"🌐 {seg['lang'].upper()}"
-                
-                if seg["error"]:
-                    output_io.write(f"[{t}] - ERROR DE SISTEMA\n\n")
-                else:
-                    output_io.write(f"[{t}] - {idioma_display}\n{seg['text']}\n\n")
+            st.rerun()
+
+    # Panel de estado simple
+    if st.session_state['calibrado']:
+        st.success("✅ Audio listo. Calidad óptima detectada.")
+
+    # Botón de acción
+    if st.button("▶️ GENERAR ACTA DE EXAMEN", type="primary"):
+        with st.status("Procesando examen...", expanded=True) as status:
             
-            st.success("El documento está listo para su descarga.")
-            st.download_button(
-                label="📥 Descargar Acta de Transcripción (.txt)",
-                data=output_io.getvalue(),
-                file_name=f"{os.path.splitext(uploaded_file.name)[0]}_transcrito.txt",
-                mime="text/plain"
-            )
-else:
-    st.info("🔒 Introduce la clave de acceso docente para desbloquear la herramienta.")
+            uploaded_file.seek(0)
+            audio_total = AudioSegment.from_file(uploaded_file)
+            max_peak = audio_total.max_dBFS
+            thresh = max_peak + st.session_state['umbral_db']
+            
+            st.write("✂️ Detectando intervenciones del alumno...")
+            chunks = silence.detect_nonsilent(audio_total, min_silence_len=st.session_state['min_silence_ms'], silence_thresh=thresh, seek_step=100)
+            
+            if not chunks: # Rescate
+                st.warning("⚠️ Voz muy baja. Reintentando con alta sensibilidad...")
+                chunks = silence.detect_nonsilent(audio_total, min_silence_len=1000, silence_thresh=max_peak-50, seek_step=100)
+            
+            if not chunks: st.error("❌ Audio vacío o irreconocible."); st.stop()
+            st.write(f"✅ {len(chunks)} intervenciones localizadas.")
+            
+            st.write("🌍 Identificando idioma B")
+            collage = crear_collage_audio(audio_total, chunks)
+            nombre_lb, iso_lb = detectar_lengua_b(client, collage)
+            
+            st.write("📝 Transcribiendo...")
+            out_buf = io.StringIO()
+            out_buf.write(f"ALUMNO/EXAMEN: {uploaded_file.name}\n")
+            out_buf.write(f"IDIOMAS DETECTADOS: ESPAÑOL (ES) - {nombre_lb} ({iso_lb})\n")
+            out_buf.write("-" * 50 + "\n\n")
+            
+            prog = st.progress(0)
+            for i, (start, end) in enumerate(chunks):
+                seg = audio_total[max(0, start-200):min(len(audio_total), end+200)]
+                dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb)
+                bloque = f"[{formatear_tiempo(start)}] [{dat.get('idioma','??')}]\n{dat.get('texto','')}\n\n"
+                out_buf.write(bloque)
+                prog.progress((i+1)/len(chunks))
+            
+            st.session_state['resultado_texto'] = out_buf.getvalue()
+            st.session_state['resultado_nombre'] = f"Acta_{uploaded_file.name}_{iso_lb}.txt"
+            status.update(label="¡Proceso Completado!", state="complete", expanded=False)
+
+# --- ZONA DE RESULTADOS (DISEÑO ERGONÓMICO) ---
+if 'resultado_texto' in st.session_state:
+    st.divider()
+    st.subheader("🎧 Revisión y Evaluación")
+    
+    # 1. ONDA VISUAL (Mapa del examen)
+    if st.session_state['waveform_img']:
+        st.image(st.session_state['waveform_img'], use_container_width=True)
+    
+    # 2. REPRODUCTOR (Ancho completo)
+    uploaded_file.seek(0)
+    st.audio(uploaded_file)
+    
+    # 3. TEXTO (Centrado y con scroll limitado)
+    st.markdown("### 📜 Acta Transcrita")
+    st.text_area(
+        label="Texto del examen",
+        value=st.session_state['resultado_texto'],
+        height=400, # Altura fija para que el audio no se pierda al hacer scroll
+        label_visibility="collapsed"
+    )
+    
+    # 4. DESCARGA (Debajo del texto)
+    st.download_button(
+        label="📥 Descargar Acta en TXT",
+        data=st.session_state['resultado_texto'],
+        file_name=st.session_state['resultado_nombre'],
+        mime="text/plain",
+        type="primary",
+        use_container_width=True
+    )
