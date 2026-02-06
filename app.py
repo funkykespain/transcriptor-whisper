@@ -8,6 +8,8 @@ from requests.auth import HTTPBasicAuth
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from pydub import AudioSegment, silence
+from dotenv import load_dotenv
+load_dotenv()
 
 # ================= CONFIGURACIÓN =================
 # Lectura de variables de entorno

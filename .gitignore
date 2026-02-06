@@ -1,6 +1,6 @@
 Byte-compiled / optimized / DLL files
 
-pycache/
+__pycache__/
 *.py[cod]
 *$py.class
 
@@ -16,3 +16,6 @@ Streamlit config
 OS Files
 
 .DS_Store
+
+.vscode/
+*.code-workspace
