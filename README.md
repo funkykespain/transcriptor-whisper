@@ -7,7 +7,7 @@
 **Acceso a la Herramienta:** https://transcriptor-web.bp1xn4.easypanel.host
 
 Herramienta web diseñada para el ámbito académico, específicamente para la asignatura de Interpretación Bilateral. Esta aplicación automatiza la transcripción de exámenes orales, gestionando la detección de intervenciones y el bilingüismo.
-
+![Interfaz de Usuario](screenshot.png)
 ## 🎯 Funcionalidades Clave
 
 - **Segmentación de Intervenciones:** Detecta automáticamente los turnos de palabra basándose en las pausas (silencios) del audio original.
