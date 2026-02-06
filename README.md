@@ -15,7 +15,7 @@ Herramienta web profesional diseñada para el ámbito académico. Esta aplicaci�
 
 | Configuración y Proceso | Revisión y Evaluación |
 |:-----------------------:|:---------------------:|
-| ![Procesamiento](screenshot1.jpg) | ![Revisión](screenshot2.jpg) |
+| ![Procesamiento](screenshot1.png) | ![Revisión](screenshot2.png) |
 
 ---
 
