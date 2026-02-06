@@ -145,7 +145,9 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
     except: return "DESCONOCIDO", "XX"
 
 def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str) -> dict:
+    # 1. Normalización previa
     b64_audio = audio_to_base64(normalizar_audio(segment_audio))
+    
     prompt_sistema = f"""
     Eres un PERITO TRANSCRIPTOR FORENSE. 
     Contexto: Examen oral. Idiomas: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
@@ -156,6 +158,7 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
     4. Formato JSON estricto.
     Output: {{"idioma": "ES" o "{lengua_b_iso}", "texto": "..."}}
     """
+
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -163,21 +166,57 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
                 {"role": "system", "content": prompt_sistema},
                 {
                     "role": "user", 
-                    "content": [{"type": "text", "text": "Analiza y transcribe:"},
-                                {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}]
+                    "content": [
+                        {"type": "text", "text": "Analiza y transcribe:"},
+                        {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}
+                    ]
                 }
             ],
-            response_format={"type": "json_object"}, temperature=0
+            response_format={"type": "json_object"}, 
+            temperature=0
         )
-        content = json.loads(response.choices[0].message.content)
-        resultado = content[0] if isinstance(content, list) and content else content
         
+        # --- BLINDAJE CONTRA ERRORES ---
+        
+        # 1. Comprobar si la API respondió algo válido
+        if not response or not response.choices:
+            return {"idioma": "ERROR", "texto": "[Error API: Respuesta vacía]"}
+            
+        # 2. Comprobar si hay mensaje
+        mensaje = response.choices[0].message
+        if not mensaje or not mensaje.content:
+             return {"idioma": "??", "texto": ""}
+
+        # 3. Parsear JSON con seguridad
+        try:
+            content = json.loads(mensaje.content)
+        except json.JSONDecodeError:
+            return {"idioma": "ERROR", "texto": "[Error: JSON inválido]"}
+            
+        # 4. Comprobar si el contenido es None (ej: el modelo devolvió 'null')
+        if content is None:
+            return {"idioma": "??", "texto": ""}
+
+        # 5. Gestionar si devuelve Lista o Diccionario
+        if isinstance(content, list):
+            # Si es lista vacía, devolvemos dict vacío
+            resultado = content[0] if content else {}
+        else:
+            resultado = content
+            
+        # 6. Validación final de tipo
+        if not isinstance(resultado, dict):
+             return {"idioma": "??", "texto": ""}
+             
+        # Limpieza de "alucinaciones" (JSON, undefined, etc)
         texto_limpio = resultado.get("texto", "").strip()
         if texto_limpio in ["JSON", "json", "JSON:", "undefined"] or not texto_limpio:
             return {"idioma": "??", "texto": ""}
 
         return resultado
-    except Exception as e: return {"idioma": "ERROR", "texto": f"[Error: {str(e)}]"}
+
+    except Exception as e:
+        return {"idioma": "ERROR", "texto": f"[Error: {str(e)}]"}
 
 # ================= INTERFAZ GRÁFICA (UI/UX ACADÉMICA) =================
 
