@@ -5,7 +5,7 @@
 # 🎙️ Transcriptor de Exámenes (v2.0)
 ## Asignatura: Interpretación Bilateral
 
-👉 [Acceso a la Herramienta](https://kyke-transcriptor.tr73iy.easypanel.host)
+👉 [Acceso a la Herramienta](http://80.225.185.122/)
 
 Herramienta web profesional diseñada para el ámbito académico. Esta aplicación automatiza la transcripción de exámenes orales utilizando **IA Generativa Multimodal (Gemini 2.0 Flash)**, garantizando actas fieles ("forenses") para la evaluación de alumnos de interpretación.
 
