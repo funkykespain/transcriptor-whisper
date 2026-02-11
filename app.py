@@ -16,7 +16,56 @@ load_dotenv()
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = os.getenv("OPENROUTER_BASE_URL")
 MODEL_NAME = os.getenv("OPENROUTER_MODEL")
-ACCESS_PASSWORD = os.getenv("ACCESS_PASSWORD")
+KOFI_URL = "https://ko-fi.com/S6S61TZEJ8"
+raw_passwords = os.getenv("ACCESS_PASSWORD", "")
+VALID_PASSWORDS = [p.strip() for p in raw_passwords.split(",") if p.strip()]
+
+# ================= ESTILOS CSS (Footer y UI) =================
+st.markdown("""
+<style>
+    /* Estilo para el Footer Fijo en la Sidebar */
+    .sidebar-footer {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        width: 100%;
+        background-color: #f0f2f6; /* Color gris claro estándar de sidebar */
+        padding: 15px 20px;
+        z-index: 999;
+        border-top: 1px solid #dcdcdc;
+        font-family: sans-serif;
+    }
+    
+    /* Modo oscuro compatible para el footer */
+    @media (prefers-color-scheme: dark) {
+        .sidebar-footer {
+            background-color: #262730;
+            border-top: 1px solid #41424b;
+        }
+    }
+
+    /* Ajuste para que el contenido del sidebar no quede tapado por el footer */
+    section[data-testid="stSidebar"] > div:first-child {
+        padding-bottom: 120px;
+    }
+
+    /* Estilo del contenedor Ko-fi */
+    .kofi-container {
+        background-color: rgba(255, 255, 255, 0.05);
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        text-align: center;
+        margin-top: 15px;
+        margin-bottom: 15px;
+    }
+    .kofi-text {
+        font-size: 0.85em;
+        margin-bottom: 10px;
+        opacity: 0.9;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ================= CONFIGURACIÓN DE IDIOMAS =================
 MAPA_ISO_IDIOMAS = {
@@ -58,22 +107,16 @@ def formatear_tiempo(ms):
 
 def generar_onda_visual(audio_segment):
     """Genera una imagen simple de la onda de audio para referencia visual."""
-    # Convertimos a array de numpy
     samples = np.array(audio_segment.get_array_of_samples())
-    
-    # Si es estéreo (aunque normalizamos antes), tomamos un canal
     if audio_segment.channels == 2:
         samples = samples[::2]
-        
-    # Submuestreo para que el gráfico no pese demasiado (1 de cada 100 muestras)
     samples = samples[::100]
 
-    fig, ax = plt.subplots(figsize=(10, 1.5)) # Ancho y bajito
+    fig, ax = plt.subplots(figsize=(10, 1.5))
     ax.plot(samples, color='#1E88E5', alpha=0.6, linewidth=0.5)
-    ax.axis('off') # Quitamos ejes y bordes
-    fig.patch.set_alpha(0) # Fondo transparente
+    ax.axis('off')
+    fig.patch.set_alpha(0)
     
-    # Convertimos plot a imagen para streamlit
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
     buf.seek(0)
@@ -88,7 +131,6 @@ def autocalibrar_audio(uploaded_file):
         peak = audio.max_dBFS
         avg = audio.dBFS
         
-        # Fórmula: Umbral = Promedio - 10dB (Margen seguridad)
         target_threshold = avg - 10 
         suggested_slider = target_threshold - peak
         suggested_slider = max(-60, min(-10, int(suggested_slider)))
@@ -144,18 +186,45 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
         else: return "IDIOMA_B", "XX"
     except: return "DESCONOCIDO", "XX"
 
-def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str) -> dict:
-    # 1. Normalización previa
+def limpiar_repeticiones(texto):
+    """
+    Detecta y ELIMINA bucles de alucinación (ej: 'la la la la la').
+    Diferencia entre un tartamudeo natural (2-3 veces) y un error de IA (+4 veces).
+    """
+    if not texto: return ""
+    
+    # 1. Caso extremo: "la la la la la la" (Alucinación de ruido)
+    # Si una palabra corta (<=3 letras) se repite más de 4 veces, es ruido casi seguro. Borramos todo.
+    patron_ruido = r'\b(\w{1,3})(\s+\1){4,}'
+    if re.search(patron_ruido, texto, flags=re.IGNORECASE):
+        return "" # Devolvemos vacío, asumimos que era ruido de papel/tos
+
+    # 2. Caso leve: Tartamudeo real o bucle pequeño
+    # Si se repite 3 veces, lo dejamos como tartamudeo (ej: "pero pero pero...")
+    return texto
+
+def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str) -> dict:
+    # 1. Normalización
     b64_audio = audio_to_base64(normalizar_audio(segment_audio))
     
+    # 2. Prompt Forense Anti-Ruido (Actualizado)
     prompt_sistema = f"""
     Eres un PERITO TRANSCRIPTOR FORENSE. 
-    Contexto: Examen oral. Idiomas: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
-    INSTRUCCIONES:
-    1. Transcribe LITERALMENTE lo que dice el ALUMNO.
-    2. Si solo hay ruido, silencio o respiración, devuelve texto vacío.
-    3. NO escribas la palabra 'JSON' ni repitas instrucciones.
-    4. Formato JSON estricto.
+    Contexto: Examen de Interpretación Bilateral.
+    Idiomas: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
+    
+    CONTEXTO PREVIO: "...{contexto_previo[-300:]}" (Idioma: {idioma_previo})
+
+    INSTRUCCIONES CLAVE:
+    1. TRANSCRIPCIÓN LITERAL (VERBATIM): Escribe EXACTAMENTE lo que escuchas.
+    2. PROHIBIDO CORREGIR: NO arregles la gramática, NO mejores el estilo, NO corrijas la pronunciación. Si el alumno dice "yo sabo", escribe "yo sabo".
+    3. INERCIA DE IDIOMA: Si el audio es ambiguo, corto o una continuación clara, MANTÉN el idioma anterior ({idioma_previo}). Solo cambia si es evidente.
+    4. GESTIÓN DE RUIDO:
+         - Si escuchas RUIDO DE PAPEL, GOLPES, TOS o RESPIRACIÓN FUERTE -> NO lo transcribas como "la la la" o sílabas sueltas. Devuelve texto vacío "".
+         - Solo transcribe si hay PALABRAS INTELIGIBLES. Si solo hay ruido, devuelve "".
+    5. PROHIBIDO REPETIR CONTEXTO: La información de "MEMORIA DE CONTEXTO" es lo que YA se dijo. NO lo vuelvas a escribir. Si el audio actual solo contiene silencio o repite lo anterior, devuelve "".
+    6. FORMATO: JSON estricto.
+    
     Output: {{"idioma": "ES" o "{lengua_b_iso}", "texto": "..."}}
     """
 
@@ -167,7 +236,7 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
                 {
                     "role": "user", 
                     "content": [
-                        {"type": "text", "text": "Analiza y transcribe:"},
+                        {"type": "text", "text": "Transcribe (Ignora ruidos de fondo/papel):"},
                         {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}
                     ]
                 }
@@ -176,49 +245,42 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
             temperature=0
         )
         
-        # --- BLINDAJE CONTRA ERRORES ---
-        
-        # 1. Comprobar si la API respondió algo válido
-        if not response or not response.choices:
-            return {"idioma": "ERROR", "texto": "[Error API: Respuesta vacía]"}
-            
-        # 2. Comprobar si hay mensaje
+        # --- VALIDACIONES ---
+        if not response or not response.choices: return {"idioma": "ERROR", "texto": ""}
         mensaje = response.choices[0].message
-        if not mensaje or not mensaje.content:
-             return {"idioma": "??", "texto": ""}
+        if not mensaje or not mensaje.content: return {"idioma": "??", "texto": ""}
 
-        # 3. Parsear JSON con seguridad
         try:
             content = json.loads(mensaje.content)
-        except json.JSONDecodeError:
-            return {"idioma": "ERROR", "texto": "[Error: JSON inválido]"}
+        except json.JSONDecodeError: return {"idioma": "ERROR", "texto": ""}
             
-        # 4. Comprobar si el contenido es None (ej: el modelo devolvió 'null')
-        if content is None:
-            return {"idioma": "??", "texto": ""}
-
-        # 5. Gestionar si devuelve Lista o Diccionario
-        if isinstance(content, list):
-            # Si es lista vacía, devolvemos dict vacío
-            resultado = content[0] if content else {}
-        else:
-            resultado = content
+        if isinstance(content, list): resultado = content[0] if content else {}
+        else: resultado = content
             
-        # 6. Validación final de tipo
-        if not isinstance(resultado, dict):
-             return {"idioma": "??", "texto": ""}
-             
-        # Limpieza de "alucinaciones" (JSON, undefined, etc)
-        texto_limpio = resultado.get("texto", "").strip()
-        if texto_limpio in ["JSON", "json", "JSON:", "undefined"] or not texto_limpio:
+        if not isinstance(resultado, dict): return {"idioma": "??", "texto": ""}
+        
+        texto_raw = resultado.get("texto", "").strip()
+        
+        # Filtros de Alucinación
+        if texto_raw.lower() in ["json", "undefined", "null"]:
             return {"idioma": "??", "texto": ""}
-
+        
+        # Filtro Anti-Eco (Python):
+        # Si el texto transcrito está contenido DENTRO del contexto previo (es una repetición exacta), lo borramos.
+        # Usamos los últimos 50 caracteres para comparar.
+        if len(texto_raw) > 10 and texto_raw in contexto_previo[-len(texto_raw)-20:]:
+             return {"idioma": "??", "texto": ""} # Es un eco, lo borramos
+            
+        # APLICAMOS EL FILTRO DE REPETICIÓN
+        texto_final = limpiar_repeticiones(texto_raw)
+        
+        resultado["texto"] = texto_final
         return resultado
 
     except Exception as e:
         return {"idioma": "ERROR", "texto": f"[Error: {str(e)}]"}
 
-# ================= INTERFAZ GRÁFICA (UI/UX ACADÉMICA) =================
+# ================= UI PRINCIPAL =================
 
 st.set_page_config(page_title="Transcriptor Bilateral", page_icon="🎓", layout="wide")
 
@@ -229,48 +291,75 @@ if 'file_id' not in st.session_state: st.session_state['file_id'] = None
 if 'calibrado' not in st.session_state: st.session_state['calibrado'] = False
 if 'waveform_img' not in st.session_state: st.session_state['waveform_img'] = None
 
-# --- CABECERA PRINCIPAL ---
-st.title("🎓 Transcripción de Exámenes")
-st.markdown("""
-**Asignatura: Interpretación Bilateral** Esta herramienta automatiza la creación del acta de examen.  
-1. **Sube el archivo de audio** del alumno.
-2. El sistema **detecta automáticamente** el segundo idioma.
-3. Se genera una **transcripción literal** (sin correcciones gramaticales) para su evaluación.
-""")
-st.divider()
-
-# --- LOGIN ---
-if ACCESS_PASSWORD:
-    pwd = st.sidebar.text_input("🔑 Clave Docente", type="password")
-    if pwd != ACCESS_PASSWORD:
-        st.warning("Introduce la clave para acceder a la herramienta.")
-        st.stop()
-
-# --- SIDEBAR LIMPIO ---
+# --- SIDEBAR + FOOTER FIJO ---
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    mostrar_ajustes = st.checkbox("Ajustes manuales para ajuste fino", value=False)
+    # Footer GitHub
+    st.markdown(
+        """
+        <div class="sidebar-footer">
+            <div style="text-align: center;">
+                <a href="https://github.com/funkykespain/transcriptor-whisper" target="_blank" 
+                   style="color: inherit; text-decoration: none; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; gap: 8px; opacity: 0.7;">
+                   <svg height="20" viewBox="0 0 16 16" version="1.1" width="20" aria-hidden="true" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
+                   Repositorio & Docs
+                </a>
+            </div>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+
+# --- CABECERA ---
+st.markdown("""
+    <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 20px;">
+        <img src="https://raw.githubusercontent.com/funkykespain/transcriptor-whisper/refs/heads/main/profile.png" 
+             alt="Logo" 
+             style="width: 70px; height: 70px; border-radius: 10px; object-fit: cover;">
+        <h1 style="margin: 0; padding: 0; font-size: 3rem;">Transcripción de Exámenes</h1>
+    </div>
+""", unsafe_allow_html=True)
+st.markdown("""
+
+**Asignatura: Interpretación Bilateral** Esta herramienta automatiza la creación del acta de examen.
+
+1. **Sube el archivo de audio** del alumno.
+
+2. El primer idioma será español (ES). El sistema **detecta automáticamente** el segundo idioma.
+
+3. Se genera una **transcripción literal** (evitando en lo posible correcciones gramaticales) para su evaluación.
+
+""")
+st.divider()
+
+# --- LOGIN CON KO-FI ---
+# Si la lista de contraseñas no está vacía, activamos el bloqueo
+if VALID_PASSWORDS:
+    pwd = st.sidebar.text_input("🔑 Clave Docente", type="password")
     
+    # Comprobamos si la clave escrita NO está en la lista de válidas
+    if pwd not in VALID_PASSWORDS:
+        st.warning("🔒 Herramienta protegida. Introduce la Clave Docente en >> Configuración.")
+        
+        st.markdown(f"""
+        <div class="kofi-container">
+            <p class="kofi-text">¿No tienes clave? Apoya el proyecto con un café (mínimo 3€) y recibirás tu Clave Docente en tu correo electrónico personal:</p>
+            <a href='{KOFI_URL}' target='_blank'>
+                <img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi2.png?v=6' border='0' alt='Invítame a un Café en ko-fi.com' />
+            </a>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+# --- AJUSTES MANUALES (Solo si hay acceso) ---
+with st.sidebar:
+    mostrar_ajustes = st.checkbox("Ajustes manuales para ajuste fino", value=False)
     if mostrar_ajustes:
         st.info("Solo modifica esto si la transcripción corta palabras o incluye ruido.")
-        
-        # Slider de dB
-        umbral_db_slider = st.slider(
-            "Sensibilidad (dB)", -60, -10, st.session_state['umbral_db'], key='slider_db',
-            help="Define qué volumen se considera 'Silencio'.\n- Más a la izquierda (-60): Detecta susurros (cuidado con el ruido).\n- Más a la derecha (-10): Ignora ruidos (cuidado con cortar voz)."
-        )
-        
-        # Input de Segundos (Convertimos a ms para el código)
+        umbral_db_slider = st.slider("Sensibilidad (dB)", -60, -10, st.session_state['umbral_db'], key='slider_db', help="Define qué volumen se considera 'Silencio'.\n- Más a la izquierda (-60): Detecta susurros (cuidado con el ruido).\n- Más a la derecha (-10): Ignora ruidos (cuidado con cortar voz).")
         silencio_sec_default = st.session_state['min_silence_ms'] / 1000
-        min_silence_sec = st.number_input(
-            "Silencio Mínimo (s)", 
-            min_value=0.5, max_value=5.0, 
-            value=silencio_sec_default, step=0.5,
-            help="Tiempo mínimo de pausa para considerar que ha terminado una frase.\n- Recomendado: 2.0 segundos."
-        )
-        
-        # Guardamos conversión
+        min_silence_sec = st.number_input("Silencio Mínimo (s)", 0.5, 5.0, value=silencio_sec_default, step=0.5, help="Tiempo mínimo de pausa para considerar que ha terminado una frase.\n- Recomendado: 2.0 segundos.")
         st.session_state['umbral_db'] = umbral_db_slider
         st.session_state['min_silence_ms'] = int(min_silence_sec * 1000)
     else:
@@ -280,10 +369,9 @@ client = get_ai_client()
 if not client: st.error("Error: API KEY no configurada"); st.stop()
 
 # --- ZONA DE CARGA ---
-uploaded_file = st.file_uploader("📂 Selecciona el archivo de audio (MP3, M4A, AAC, WAV)", type=['mp3', 'm4a', 'wav', 'aac'])
+uploaded_file = st.file_uploader("📂 Selecciona el archivo de audio (MP3, M4A, WAV, AAC)", type=['mp3', 'm4a', 'wav', 'aac'])
 
 if uploaded_file:
-    # Auto-calibración al cambiar archivo
     file_id_actual = uploaded_file.name + str(uploaded_file.size)
     if st.session_state['file_id'] != file_id_actual:
         with st.spinner("🔄 Analizando calidad del audio..."):
@@ -293,18 +381,13 @@ if uploaded_file:
             st.session_state['file_id'] = file_id_actual
             st.session_state['calibrado'] = True
             
-            # Generamos la onda visual UNA vez y la guardamos
             uploaded_file.seek(0)
             audio_temp = AudioSegment.from_file(uploaded_file)
             st.session_state['waveform_img'] = generar_onda_visual(audio_temp)
-            
             st.rerun()
 
-    # Panel de estado simple
-    if st.session_state['calibrado']:
-        st.success("✅ Audio listo. Calidad óptima detectada.")
+    if st.session_state['calibrado']: st.success("✅ Audio listo. Calidad óptima detectada.")
 
-    # Botón de acción
     if st.button("▶️ GENERAR ACTA DE EXAMEN", type="primary"):
         with st.status("Procesando examen...", expanded=True) as status:
             
@@ -315,29 +398,48 @@ if uploaded_file:
             
             st.write("✂️ Detectando intervenciones del alumno...")
             chunks = silence.detect_nonsilent(audio_total, min_silence_len=st.session_state['min_silence_ms'], silence_thresh=thresh, seek_step=100)
-            
-            if not chunks: # Rescate
+            if not chunks: 
                 st.warning("⚠️ Voz muy baja. Reintentando con alta sensibilidad...")
                 chunks = silence.detect_nonsilent(audio_total, min_silence_len=1000, silence_thresh=max_peak-50, seek_step=100)
-            
             if not chunks: st.error("❌ Audio vacío o irreconocible."); st.stop()
             st.write(f"✅ {len(chunks)} intervenciones localizadas.")
             
-            st.write("🌍 Identificando idioma B")
+            st.write("🌍 Identificando idioma...")
             collage = crear_collage_audio(audio_total, chunks)
             nombre_lb, iso_lb = detectar_lengua_b(client, collage)
             
-            st.write("📝 Transcribiendo...")
+            st.write("📝 Transcribiendo con contexto inteligente...")
             out_buf = io.StringIO()
             out_buf.write(f"ALUMNO/EXAMEN: {uploaded_file.name}\n")
             out_buf.write(f"IDIOMAS DETECTADOS: ESPAÑOL (ES) - {nombre_lb} ({iso_lb})\n")
             out_buf.write("-" * 50 + "\n\n")
             
             prog = st.progress(0)
+            
+            # --- BUCLE CON CONTEXTO (Lógica V2.1.0) ---
+            historial_contexto = ""
+            idioma_actual = "ES"
+            
             for i, (start, end) in enumerate(chunks):
                 seg = audio_total[max(0, start-200):min(len(audio_total), end+200)]
-                dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb)
-                bloque = f"[{formatear_tiempo(start)}] [{dat.get('idioma','??')}]\n{dat.get('texto','')}\n\n"
+                
+                # Llamada a la función forense V2.1.0
+                dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual)
+                
+                texto_segmento = dat.get('texto','')
+                idioma_detectado = dat.get('idioma','??')
+                
+                # Actualizar contexto (si hay texto válido)
+                if texto_segmento:
+                    historial_contexto += f" {texto_segmento}"
+                    if len(historial_contexto) > 800: # Limite para no saturar
+                        historial_contexto = historial_contexto[-800:]
+                
+                # Actualizar inercia de idioma
+                if idioma_detectado in ["ES", iso_lb]:
+                    idioma_actual = idioma_detectado
+                
+                bloque = f"[{formatear_tiempo(start)}] [{idioma_detectado}]\n{texto_segmento}\n\n"
                 out_buf.write(bloque)
                 prog.progress((i+1)/len(chunks))
             
@@ -345,34 +447,18 @@ if uploaded_file:
             st.session_state['resultado_nombre'] = f"Acta_{uploaded_file.name}_{iso_lb}.txt"
             status.update(label="¡Proceso Completado!", state="complete", expanded=False)
 
-# --- ZONA DE RESULTADOS (DISEÑO ERGONÓMICO) ---
+# --- RESULTADOS ---
 if 'resultado_texto' in st.session_state:
     st.divider()
     st.subheader("🎧 Revisión y Evaluación")
     
-    # 1. ONDA VISUAL (Mapa del examen)
     if st.session_state['waveform_img']:
         st.image(st.session_state['waveform_img'], use_container_width=True)
     
-    # 2. REPRODUCTOR (Ancho completo)
     uploaded_file.seek(0)
     st.audio(uploaded_file)
     
-    # 3. TEXTO (Centrado y con scroll limitado)
     st.markdown("### 📜 Acta Transcrita")
-    st.text_area(
-        label="Texto del examen",
-        value=st.session_state['resultado_texto'],
-        height=400, # Altura fija para que el audio no se pierda al hacer scroll
-        label_visibility="collapsed"
-    )
+    st.text_area(label="Texto del examen", value=st.session_state['resultado_texto'], height=400, label_visibility="collapsed")
     
-    # 4. DESCARGA (Debajo del texto)
-    st.download_button(
-        label="📥 Descargar Acta en TXT",
-        data=st.session_state['resultado_texto'],
-        file_name=st.session_state['resultado_nombre'],
-        mime="text/plain",
-        type="primary",
-        use_container_width=True
-    )
+    st.download_button(label="📥 Descargar Acta en TXT", data=st.session_state['resultado_texto'], file_name=st.session_state['resultado_nombre'], mime="text/plain", type="primary", use_container_width=True)
