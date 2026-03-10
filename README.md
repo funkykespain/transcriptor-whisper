@@ -151,5 +151,5 @@ La aplicación estará disponible en `http://localhost:8501`.
 ---
 
 <div align="center">
-<small>Desarrollado con Streamlit y Google Gemini</small>
+<small>Desarrollado con Streamlit</small>
 </div>
