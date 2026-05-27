@@ -8,7 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/funkykespain/transcriptor-whisper?style=flat-square)](https://github.com/funkykespain/transcriptor-whisper/releases)
 [![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-red?style=flat-square&logo=ko-fi)](https://ko-fi.com/funkykespain)
 
-👉 **[Acceso a la Herramienta](http://80.225.185.122/)**
+👉 **[Acceso a la Herramienta](https://transcrapp.kyke.dpdns.org)**
 
 Herramienta web profesional diseñada para el ámbito académico ("Forensic Transcription"). Esta aplicación automatiza la transcripción de exámenes orales utilizando **IA Generativa Multimodal (Gemini Flash)**, garantizando actas fieles y literales para la evaluación de alumnos de interpretación.
 
