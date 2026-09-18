@@ -172,10 +172,18 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
                 {
                     "role": "user", 
                     "content": [{"type": "text", "text": "Código ISO:"},
-                                {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}]
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": b64_audio,
+                                        "format": "mp3"
+                                    }
+                                }]
                 }
             ],
-            temperature=0, max_tokens=10
+            temperature=0,
+            top_p=1,
+            max_tokens=10
         )
         raw_text = response.choices[0].message.content.strip().upper()
         patron_idiomas = r'\b(' + '|'.join(MAPA_ISO_IDIOMAS.keys()) + r')\b'
@@ -237,12 +245,19 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
                     "role": "user", 
                     "content": [
                         {"type": "text", "text": "Transcribe (Ignora ruidos de fondo/papel):"},
-                        {"type": "image_url", "image_url": {"url": f"data:audio/mp3;base64,{b64_audio}"}}
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": b64_audio,
+                                "format": "mp3"
+                            }
+                        }
                     ]
                 }
             ],
             response_format={"type": "json_object"}, 
-            temperature=0
+            temperature=0,
+            top_p=1
         )
         
         # --- VALIDACIONES ---

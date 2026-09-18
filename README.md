@@ -2,7 +2,7 @@
 <img src="profile.png" alt="Transcriptor Profile" width="150"/>
 </p>
 
-# 🎓 Transcriptor de Exámenes (v2.1)
+# 🎓 Transcriptor de Exámenes (v2.1.1)
 ## Asignatura: Interpretación Bilateral
 
 [![Release](https://img.shields.io/github/v/release/funkykespain/transcriptor-whisper?style=flat-square)](https://github.com/funkykespain/transcriptor-whisper/releases)
@@ -10,7 +10,7 @@
 
 👉 **[Acceso a la Herramienta](https://transcrapp.kyke.dpdns.org)**
 
-Herramienta web profesional diseñada para el ámbito académico ("Forensic Transcription"). Esta aplicación automatiza la transcripción de exámenes orales utilizando **IA Generativa Multimodal (Gemini Flash)**, garantizando actas fieles y literales para la evaluación de alumnos de interpretación.
+Herramienta web profesional diseñada para el ámbito académico ("Forensic Transcription"). Esta aplicación automatiza la transcripción de exámenes orales utilizando **IA Generativa Multimodal a través de OpenRouter** con soporte multimodelo (ej. **Mistral Voxtral** y **Google Gemini Flash**), garantizando actas fieles y literales para la evaluación de alumnos de interpretación.
 
 ---
 
@@ -47,6 +47,12 @@ Al finalizar, aparecerá el entorno de corrección:
 
 ---
 
+## 🚀 Novedades de la Versión 2.1.1
+
+> **v2.1.1**: Compatibilidad multimodelo completa en OpenRouter (Mistral Voxtral + Google Gemini). Corrección de parámetros de muestreo (`top_p=1` con `temperature=0`) para llamadas API estrictas.
+
+---
+
 ## ✨ Novedades de la Versión 2.1
 
 Esta versión introduce mejoras críticas en la lógica de transcripción y gestión de usuarios:
@@ -72,7 +78,7 @@ Crea un archivo `.env` en la raíz con las siguientes claves:
 | Variable | Descripción | Ejemplo |
 | :--- | :--- | :--- |
 | `OPENROUTER_API_KEY` | **(Obligatorio)** Tu clave de API de OpenRouter. | `sk-or-v1-...` |
-| `OPENROUTER_MODEL` | Modelo a utilizar (Recomendado: Flash Lite o Pro). | `google/gemini-2.5-flash-lite` |
+| `OPENROUTER_MODEL` | Modelo a utilizar. Compatibles recomendados: `mistralai/voxtral-small-24b-2507` (Recomendado) o `google/gemini-2.5-flash-lite`. | `mistralai/voxtral-small-24b-2507`<br>`google/gemini-2.5-flash-lite` |
 | `OPENROUTER_BASE_URL`| URL base de la API. | `https://openrouter.ai/api/v1` |
 | `ACCESS_PASSWORD` | **Claves de acceso.** Soporta múltiples contraseñas separadas por comas. | `ClaveProfe,Alumno2026,InvitadoVIP` |
 
@@ -151,5 +157,5 @@ La aplicación estará disponible en `http://localhost:8501`.
 ---
 
 <div align="center">
-<small>Desarrollado con Streamlit</small>
+<small>Desarrollado con Streamlit, OpenRouter, Mistral Voxtral y Google Gemini</small>
 </div>
