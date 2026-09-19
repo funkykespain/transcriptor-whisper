@@ -2,7 +2,7 @@
 <img src="profile.png" alt="Transcriptor Profile" width="150"/>
 </p>
 
-# 🎓 Transcriptor de Exámenes (v2.1.1)
+# 🎓 Transcriptor de Exámenes (v2.1.2)
 ## Asignatura: Interpretación Bilateral
 
 [![Release](https://img.shields.io/github/v/release/funkykespain/transcriptor-whisper?style=flat-square)](https://github.com/funkykespain/transcriptor-whisper/releases)
@@ -44,6 +44,18 @@ Al finalizar, aparecerá el entorno de corrección:
 *En la barra lateral, puedes desplegar los "Ajustes manuales" si necesitas afinar la sensibilidad para audios muy bajos o ruidosos. Una vez reajustado manualmente, vuelve a pulsar el botón "GENERAR ACTA DE EXAMEN" para que los cambios surtan efecto.*
 
 ![Resultado Final](screenshot4.png)
+
+---
+
+## 🚀 Novedades de la Versión 2.1.2
+
+> **v2.1.2**: Optimización de precisión acústica y refactorización pericial agnóstica del motor de transcripción.
+
+* 🎙️ **Filtro Pasa-Altos Reequilibrado (100 Hz):** Ajustado de 200 Hz a 100 Hz para preservar la calidez de las voces graves y evitar pérdidas de señal en desvanecimientos tenues de voz.
+* ⏱️ **Margen Temporal Ampliado (Padding de 600 ms):** Ampliado de 200 ms a 600 ms por intervalo de audio para garantizar la captura completa de finales de frase e inflexiones finales del alumno.
+* 📜 **Prompt Forense Agnóstico (Principios Universales):** Reestructuración integral del prompt en principios universales de fidelidad fonética, discriminación de ruido y aislamiento de memoria, eliminando reglas o palabras de ejemplo hardcodeadas para garantizar cero sesgo por idioma o examen.
+* 🛡️ **Petición Limpia al LMM (Anti Prompt Leakage):** Eliminación de objetos de texto intermedios en la carga 'user', enviando exclusivamente el buffer de audio para erradicar la fuga de instrucciones en tramos de silencio.
+* 🔍 **Filtro Anti-Echo en Python Reajustado:** Validación determinista en Python para descartar reproducciones de memoria comparando con la ventana exacta de 300 caracteres del LMM.
 
 ---
 
@@ -91,7 +103,7 @@ Ideal para desplegar en VPS (DigitalOcean, Hetzner, AWS) con recursos mínimos (
 ### 1. Construir la imagen
 
 ```bash
-docker build -t transcriptor-bilateral:v2.1 .
+docker build -t transcriptor-bilateral:v2.1.2 .
 
 ```
 
@@ -102,7 +114,7 @@ docker run -d -p 8501:8501 \
   --env-file .env \
   --name transcriptor-app \
   --restart unless-stopped \
-  transcriptor-bilateral:v2.1
+  transcriptor-bilateral:v2.1.2
 
 ```
 

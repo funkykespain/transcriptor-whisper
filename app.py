@@ -91,7 +91,10 @@ def get_ai_client():
 def normalizar_audio(audio: AudioSegment) -> AudioSegment:
     audio = audio.set_channels(1)
     audio = audio.set_frame_rate(16000)
-    audio = audio.high_pass_filter(200) 
+    # Filtro Acústico Equilibrado (agnóstico al micro y la voz):
+    # 100 Hz elimina el retumbe grave de fondo sin tijeretear la voz tenue
+    # ni los finales de frase cuando el alumno baja la voz.
+    audio = audio.high_pass_filter(100)
     return audio
 
 def audio_to_base64(audio_segment: AudioSegment) -> str:
@@ -194,45 +197,38 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
         else: return "IDIOMA_B", "XX"
     except: return "DESCONOCIDO", "XX"
 
-def limpiar_repeticiones(texto):
-    """
-    Detecta y ELIMINA bucles de alucinación (ej: 'la la la la la').
-    Diferencia entre un tartamudeo natural (2-3 veces) y un error de IA (+4 veces).
-    """
-    if not texto: return ""
-    
-    # 1. Caso extremo: "la la la la la la" (Alucinación de ruido)
-    # Si una palabra corta (<=3 letras) se repite más de 4 veces, es ruido casi seguro. Borramos todo.
-    patron_ruido = r'\b(\w{1,3})(\s+\1){4,}'
-    if re.search(patron_ruido, texto, flags=re.IGNORECASE):
-        return "" # Devolvemos vacío, asumimos que era ruido de papel/tos
-
-    # 2. Caso leve: Tartamudeo real o bucle pequeño
-    # Si se repite 3 veces, lo dejamos como tartamudeo (ej: "pero pero pero...")
-    return texto
-
 def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str) -> dict:
     # 1. Normalización
     b64_audio = audio_to_base64(normalizar_audio(segment_audio))
     
-    # 2. Prompt Forense Anti-Ruido (Actualizado)
+    # 2. Prompt Forense General (Principios Periciales Universales)
     prompt_sistema = f"""
-    Eres un PERITO TRANSCRIPTOR FORENSE. 
+    Eres un PERITO TRANSCRIPTOR FORENSE con especialización en análisis acústico y lingüístico multilingüe.
     Contexto: Examen de Interpretación Bilateral.
-    Idiomas: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
-    
-    CONTEXTO PREVIO: "...{contexto_previo[-300:]}" (Idioma: {idioma_previo})
+    Idiomas involucrados: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
 
-    INSTRUCCIONES CLAVE:
-    1. TRANSCRIPCIÓN LITERAL (VERBATIM): Escribe EXACTAMENTE lo que escuchas.
-    2. PROHIBIDO CORREGIR: NO arregles la gramática, NO mejores el estilo, NO corrijas la pronunciación. Si el alumno dice "yo sabo", escribe "yo sabo".
-    3. INERCIA DE IDIOMA: Si el audio es ambiguo, corto o una continuación clara, MANTÉN el idioma anterior ({idioma_previo}). Solo cambia si es evidente.
-    4. GESTIÓN DE RUIDO:
-         - Si escuchas RUIDO DE PAPEL, GOLPES, TOS o RESPIRACIÓN FUERTE -> NO lo transcribas como "la la la" o sílabas sueltas. Devuelve texto vacío "".
-         - Solo transcribe si hay PALABRAS INTELIGIBLES. Si solo hay ruido, devuelve "".
-    5. PROHIBIDO REPETIR CONTEXTO: La información de "MEMORIA DE CONTEXTO" es lo que YA se dijo. NO lo vuelvas a escribir. Si el audio actual solo contiene silencio o repite lo anterior, devuelve "".
-    6. FORMATO: JSON estricto.
-    
+    MEMORIA PREVIA (solo referencia): "...{contexto_previo[-300:]}" - Idioma reportado en el fragmento anterior: {idioma_previo}
+
+    PRINCIPIOS PERICIALES UNIVERSALES:
+
+    a) FIDELIDAD FONÉTICA Y NO CORRECCIÓN:
+       - Transcribe de manera estrictamente literal las ondas sonoras del audio.
+       - Si el hablante comete una incorrección gramatical, utiliza una variante no estándar, pronuncia mal una palabra o inventa un término, DEBES transcribir la forma exacta percibida en el audio.
+       - Queda estrictamente prohibido normalizar, corregir ortográficamente o estandarizar el vocabulario al idioma normativo.
+
+    b) IDENTIFICACIÓN PRECISA DE IDIOMA B:
+       - Analiza la estructura y los términos del fragmento de audio ACTUAL para asignar el código de idioma correcto (ES o {lengua_b_iso}).
+       - Las frases cortas o con elementos propios de la Lengua B deben etiquetarse adecuadamente, superando la inercia del contexto en español cuando el alumno cambie de idioma.
+
+    c) DISCRIMINACIÓN DE RUIDO MECÁNICO:
+       - Si el segmento solo contiene ruidos de fondo (paso de páginas, roces, tos) sin habla humana inteligible, devuelve únicamente el texto vacío "".
+
+    d) AISLAMIENTO DE MEMORIA:
+       - Utiliza el contexto previo SOLO como referencia para resolver ambigüedades del fragmento actual.
+       - Queda estrictamente prohibido traducir, repetir o incluir en la respuesta texto proveniente de la memoria previa que no corresponda al audio actual.
+
+    FORMATO: Responde únicamente en JSON estricto.
+
     Output: {{"idioma": "ES" o "{lengua_b_iso}", "texto": "..."}}
     """
 
@@ -242,9 +238,8 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
             messages=[
                 {"role": "system", "content": prompt_sistema},
                 {
-                    "role": "user", 
+                    "role": "user",
                     "content": [
-                        {"type": "text", "text": "Transcribe (Ignora ruidos de fondo/papel):"},
                         {
                             "type": "input_audio",
                             "input_audio": {
@@ -276,20 +271,21 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
         
         texto_raw = resultado.get("texto", "").strip()
         
-        # Filtros de Alucinación
+        # Único filtro técnico (no lingüístico): rechaza marcadores de placeholder
+        # que el modelo puede emitir cuando no produce contenido real.
         if texto_raw.lower() in ["json", "undefined", "null"]:
             return {"idioma": "??", "texto": ""}
         
-        # Filtro Anti-Eco (Python):
-        # Si el texto transcrito está contenido DENTRO del contexto previo (es una repetición exacta), lo borramos.
-        # Usamos los últimos 50 caracteres para comparar.
-        if len(texto_raw) > 10 and texto_raw in contexto_previo[-len(texto_raw)-20:]:
-             return {"idioma": "??", "texto": ""} # Es un eco, lo borramos
-            
-        # APLICAMOS EL FILTRO DE REPETICIÓN
-        texto_final = limpiar_repeticiones(texto_raw)
+        # Filtro Técnico Anti-Echo (Python): si la transcripción (mayor a 15 caracteres)
+        # reproduce literalmente la cola final de la memoria previa, se descarta como eco.
+        # Previene repeticiones de memoria en fragmentos que solo contienen silencio o ruido blanco.
+        if len(texto_raw) > 15 and texto_raw in contexto_previo[-300:]:
+            return {"idioma": "??", "texto": ""}
         
-        resultado["texto"] = texto_final
+        # Sin listas ni reglas hardcodeadas: la discriminación de ruido y el
+        # aislamiento de memoria los resuelve el modelo pericial mediante los
+        # principios universales definidos en el prompt.
+        resultado["texto"] = texto_raw
         return resultado
 
     except Exception as e:
@@ -436,7 +432,9 @@ if uploaded_file:
             idioma_actual = "ES"
             
             for i, (start, end) in enumerate(chunks):
-                seg = audio_total[max(0, start-200):min(len(audio_total), end+200)]
+                # Margen Temporal Ampliado (600 ms): captura caídas graduales de
+                # intensidad sonora y desvanecimientos de voz al final de las frases.
+                seg = audio_total[max(0, start - 600):min(len(audio_total), end + 600)]
                 
                 # Llamada a la función forense V2.1.0
                 dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual)
@@ -450,7 +448,8 @@ if uploaded_file:
                     if len(historial_contexto) > 800: # Limite para no saturar
                         historial_contexto = historial_contexto[-800:]
                 
-                # Actualizar inercia de idioma
+                # Mantener registro del último idioma detectado como contexto de continuidad
+                # (el prompt decide el idioma real del fragmento actual sin sesgo de inercia).
                 if idioma_detectado in ["ES", iso_lb]:
                     idioma_actual = idioma_detectado
                 
