@@ -1,14 +1,25 @@
 import streamlit as st
+import logging
 import os
 import io
 import base64
 import json
 import re
+import sys
+import tempfile
 import numpy as np
 import matplotlib.pyplot as plt
 from pydub import AudioSegment, silence
 from openai import OpenAI
 from dotenv import load_dotenv
+
+# Módulos locales (audio_preprocessing, audio_vad): asegura su import aunque
+# la app se lance desde otro directorio o entornos tipo AppTest/testing.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from audio_preprocessing import preprocess_audio_base
+
+logger = logging.getLogger(__name__)
 
 # ================= CONFIGURACIÓN INICIAL =================
 load_dotenv()
@@ -88,7 +99,8 @@ def get_ai_client():
     if not API_KEY: return None
     return OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
-def normalizar_audio(audio: AudioSegment) -> AudioSegment:
+def _normalizar_audio_legacy(audio: AudioSegment) -> AudioSegment:
+    """Normalización mínima con pydub (fallback si el pipeline FFmpeg no está)."""
     audio = audio.set_channels(1)
     audio = audio.set_frame_rate(16000)
     # Filtro Acústico Equilibrado (agnóstico al micro y la voz):
@@ -96,6 +108,25 @@ def normalizar_audio(audio: AudioSegment) -> AudioSegment:
     # ni los finales de frase cuando el alumno baja la voz.
     audio = audio.high_pass_filter(100)
     return audio
+
+def normalizar_audio(audio: AudioSegment) -> AudioSegment:
+    """Pre-tratamiento homogéneo de la entrada (Fase 1 del pipeline ASR).
+
+    Delega en :func:`audio_preprocessing.preprocess_audio_base` para obtener
+    PCM 16 kHz / mono / 16-bit, paso alto a 80 Hz y normalización EBU R128 a
+    -18 LUFS. Si FFmpeg no está disponible o falla, se conserva el
+    comportamiento legacy de pydub para no romper el flujo de la aplicación.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            in_path = os.path.join(tmp, "normalizar_in.wav")
+            out_path = os.path.join(tmp, "normalizar_out.wav")
+            audio.export(in_path, format="wav")
+            preprocess_audio_base(in_path, out_path)
+            return AudioSegment.from_file(out_path, format="wav")
+    except Exception as exc:  # noqa: BLE001 - fallback controlado de todo el pipeline
+        logger.warning("Pipeline FFmpeg no disponible (%s); usamos normalización legacy.", exc)
+        return _normalizar_audio_legacy(audio)
 
 def audio_to_base64(audio_segment: AudioSegment) -> str:
     buffer = io.BytesIO()
