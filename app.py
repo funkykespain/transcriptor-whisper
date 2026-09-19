@@ -18,6 +18,11 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from audio_preprocessing import preprocess_audio_base
+from audio_vad import (
+    detect_speech_segments,
+    export_speech_chunks,
+    speech_segments_to_ranges,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,9 +233,14 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
         else: return "IDIOMA_B", "XX"
     except: return "DESCONOCIDO", "XX"
 
-def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str) -> dict:
+def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str, language_hint: str = "auto") -> dict:
     # 1. Normalización
     b64_audio = audio_to_base64(normalizar_audio(segment_audio))
+    # TODO(Fase 4 - LID): con ASR local (Whisper) se forzará
+    # language=language_hint ('es' | 'it' | ...) según el idioma de cada
+    # segmento, manteniendo cada chunk con su timestamp relativo al original.
+    if language_hint != "auto":
+        logger.debug("language_hint del segmento: %s", language_hint)
     
     # 2. Prompt Forense General (Principios Periciales Universales)
     prompt_sistema = f"""
@@ -432,65 +442,99 @@ if uploaded_file:
 
     if st.button("▶️ GENERAR ACTA DE EXAMEN", type="primary"):
         with st.status("Procesando examen...", expanded=True) as status:
+            with tempfile.TemporaryDirectory() as tmp_work:
             
-            uploaded_file.seek(0)
-            audio_total = AudioSegment.from_file(uploaded_file)
-            max_peak = audio_total.max_dBFS
-            thresh = max_peak + st.session_state['umbral_db']
-            
-            st.write("✂️ Detectando intervenciones del alumno...")
-            chunks = silence.detect_nonsilent(audio_total, min_silence_len=st.session_state['min_silence_ms'], silence_thresh=thresh, seek_step=100)
-            if not chunks: 
-                st.warning("⚠️ Voz muy baja. Reintentando con alta sensibilidad...")
-                chunks = silence.detect_nonsilent(audio_total, min_silence_len=1000, silence_thresh=max_peak-50, seek_step=100)
-            if not chunks: st.error("❌ Audio vacío o irreconocible."); st.stop()
-            st.write(f"✅ {len(chunks)} intervenciones localizadas.")
-            
-            st.write("🌍 Identificando idioma...")
-            collage = crear_collage_audio(audio_total, chunks)
-            nombre_lb, iso_lb = detectar_lengua_b(client, collage)
-            
-            st.write("📝 Transcribiendo con contexto inteligente...")
-            out_buf = io.StringIO()
-            out_buf.write(f"ALUMNO/EXAMEN: {uploaded_file.name}\n")
-            out_buf.write(f"IDIOMAS DETECTADOS: ESPAÑOL (ES) - {nombre_lb} ({iso_lb})\n")
-            out_buf.write("-" * 50 + "\n\n")
-            
-            prog = st.progress(0)
-            
-            # --- BUCLE CON CONTEXTO (Lógica V2.1.0) ---
-            historial_contexto = ""
-            idioma_actual = "ES"
-            
-            for i, (start, end) in enumerate(chunks):
-                # Margen Temporal Ampliado (600 ms): captura caídas graduales de
-                # intensidad sonora y desvanecimientos de voz al final de las frases.
-                seg = audio_total[max(0, start - 600):min(len(audio_total), end + 600)]
+                uploaded_file.seek(0)
+                audio_total = AudioSegment.from_file(uploaded_file)
+                max_peak = audio_total.max_dBFS
+                thresh = max_peak + st.session_state['umbral_db']
                 
-                # Llamada a la función forense V2.1.0
-                dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual)
+                # --- FASE 1: pre-tratamiento del audio completo (16 kHz / mono / -18 LUFS) ---
+                st.write("🎛️ Pre-tratando audio (F1: 16 kHz / mono / EBU R128 -18 LUFS)...")
+                st.session_state['chunks_exportados'] = []
+                chunks, segments_vad = [], []
+                try:
+                    src_path = os.path.join(tmp_work, "entrada_audio")
+                    with open(src_path, "wb") as fh:
+                        fh.write(uploaded_file.getvalue())
+                    audio_norm_path = os.path.join(tmp_work, "audio_normalizado.wav")
+                    preprocess_audio_base(src_path, audio_norm_path)
+                    
+                    # --- FASE 2: voz con Silero VAD + padding de 400 ms ---
+                    st.write("✂️ Detectando intervenciones con Silero VAD (F2)...")
+                    segments_vad = detect_speech_segments(
+                        audio_norm_path,
+                        threshold=0.5,
+                        min_silence_duration_ms=st.session_state['min_silence_ms'],
+                    )
+                    # Timestamps (ms) relativos al audio original (misma duración)
+                    chunks = speech_segments_to_ranges(segments_vad)
+                    if segments_vad:
+                        chunks_dir = tempfile.mkdtemp(prefix="chunks_vad_")
+                        st.session_state['chunks_exportados'] = export_speech_chunks(
+                            audio_norm_path, segments_vad, chunks_dir
+                        )
+                except Exception:
+                    logger.warning("Fase 1/2 con fallo; se usa detección clásica.", exc_info=True)
                 
-                texto_segmento = dat.get('texto','')
-                idioma_detectado = dat.get('idioma','??')
+                # --- Fallback clásico si el VAD no localiza voz ---
+                if not chunks:
+                    st.warning("⚠️ VAD sin voz segura. Reintentando con alta sensibilidad...")
+                    chunks = silence.detect_nonsilent(audio_total, min_silence_len=st.session_state['min_silence_ms'], silence_thresh=thresh, seek_step=100)
+                if not chunks:
+                    chunks = silence.detect_nonsilent(audio_total, min_silence_len=1000, silence_thresh=max_peak-50, seek_step=100)
+                if not chunks: st.error("❌ Audio vacío o irreconocible."); st.stop()
+                st.write(f"✅ {len(chunks)} intervenciones localizadas.")
                 
-                # Actualizar contexto (si hay texto válido)
-                if texto_segmento:
-                    historial_contexto += f" {texto_segmento}"
-                    if len(historial_contexto) > 800: # Limite para no saturar
-                        historial_contexto = historial_contexto[-800:]
+                st.write("🌍 Identificando idioma...")
+                collage = crear_collage_audio(audio_total, chunks)
+                nombre_lb, iso_lb = detectar_lengua_b(client, collage)
                 
-                # Mantener registro del último idioma detectado como contexto de continuidad
-                # (el prompt decide el idioma real del fragmento actual sin sesgo de inercia).
-                if idioma_detectado in ["ES", iso_lb]:
-                    idioma_actual = idioma_detectado
+                st.write("📝 Transcribiendo con contexto inteligente...")
+                out_buf = io.StringIO()
+                out_buf.write(f"ALUMNO/EXAMEN: {uploaded_file.name}\n")
+                out_buf.write(f"IDIOMAS DETECTADOS: ESPAÑOL (ES) - {nombre_lb} ({iso_lb})\n")
+                out_buf.write("-" * 50 + "\n\n")
                 
-                bloque = f"[{formatear_tiempo(start)}] [{idioma_detectado}]\n{texto_segmento}\n\n"
-                out_buf.write(bloque)
-                prog.progress((i+1)/len(chunks))
-            
-            st.session_state['resultado_texto'] = out_buf.getvalue()
-            st.session_state['resultado_nombre'] = f"Acta_{uploaded_file.name}_{iso_lb}.txt"
-            status.update(label="¡Proceso Completado!", state="complete", expanded=False)
+                prog = st.progress(0)
+                
+                # --- BUCLE CON CONTEXTO (Lógica V2.1.0) ---
+                historial_contexto = ""
+                idioma_actual = "ES"
+                
+                for i, (start, end) in enumerate(chunks):
+                    # Los tramos VAD ya incluyen el padding de 400 ms y son
+                    # relativos al audio original: el texto queda sincronizado
+                    # con los segundos exactos del examen.
+                    seg = audio_total[start:min(end, len(audio_total))]
+                    
+                    # Fase 4 (LID) preparado: idioma forzado que recibirá la ASR
+                    # por segmento (language='es' | 'it' | ... según el tramo).
+                    language_hint = "es" if idioma_actual == "ES" else iso_lb.lower()
+                    
+                    dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual, language_hint=language_hint)
+                    
+                    texto_segmento = dat.get('texto','')
+                    idioma_detectado = dat.get('idioma','??')
+                    
+                    # Actualizar contexto (si hay texto válido)
+                    if texto_segmento:
+                        historial_contexto += f" {texto_segmento}"
+                        if len(historial_contexto) > 800: # Limite para no saturar
+                            historial_contexto = historial_contexto[-800:]
+                    
+                    # Mantener registro del último idioma detectado como contexto de continuidad
+                    # (el prompt decide el idioma real del fragmento actual sin sesgo de inercia).
+                    if idioma_detectado in ["ES", iso_lb]:
+                        idioma_actual = idioma_detectado
+                    
+                    bloque = f"[{formatear_tiempo(start)}] [{idioma_detectado}]\n{texto_segmento}\n\n"
+                    out_buf.write(bloque)
+                    prog.progress((i+1)/len(chunks))
+                
+                st.session_state['resultado_texto'] = out_buf.getvalue()
+                st.session_state['resultado_nombre'] = f"Acta_{uploaded_file.name}_{iso_lb}.txt"
+                status.update(label="¡Proceso Completado!", state="complete", expanded=False)
 
 # --- RESULTADOS ---
 if 'resultado_texto' in st.session_state:

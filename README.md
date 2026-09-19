@@ -118,6 +118,32 @@ docker run -d -p 8501:8501 \
 
 ```
 
+### 🖥️ Nota para ARM / CPU sin GPU (Ampere A1 en Easypanel, VPS aarch64...)
+
+El `Dockerfile` instala el paquete `silero-vad` **sin dependencias**
+(`pip install --no-deps`) y fuerza el backend VAD **ONNX puro**
+(`AUDIO_VAD_BACKEND=onnx`): la detección de voz corre con `onnxruntime` +
+`numpy` usando el modelo oficial `silero_vad.onnx` (empaquetado, ~2 MB), sin
+cargar PyTorch en memoria.
+
+* ✅ **No se descarga PyTorch** → imagen Docker ligera (sin los wheels CUDA
+  de PyPI que superan los 2 GB).
+* ✅ Todo el resto (FFmpeg, numpy, onnxruntime, Streamlit) tiene soporte
+  arm64/aarch64 nativo.
+
+Opcional: si prefieres usar el backend PyTorch en CPU, instala primero la
+variante CPU y luego el resto:
+
+```bash
+pip install -r requirements-torch-cpu.txt   # --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+```
+
+| Variable | Efecto |
+| :--- | :--- |
+| `AUDIO_VAD_BACKEND` | `onnx` (por defecto en Docker, sin torch) o `torch`. Si no se define, el sistema usa `torch` si está disponible y cae a `onnx` si no. |
+| `SILERO_VAD_ONNX_PATH` | Ruta alternativa al `silero_vad.onnx` (por defecto usa el empaquetado). |
+
 ---
 
 ## 💻 Ejecución Local (Desarrollo)

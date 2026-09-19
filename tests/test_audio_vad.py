@@ -213,3 +213,86 @@ def test_cut_speech_chunk_recorta_en_muestra_exacta(tmp_path):
     assert returned == str(out.resolve())
     samples, _, _, _ = _read_wav(out)
     assert len(samples) == int(16000 * 1.5)
+
+
+# ---------------------------------------------------------------------------
+# 5) Utilidades del pipeline (app.py / Fase 3 y Fase 4)
+# ---------------------------------------------------------------------------
+def test_speech_segments_to_ranges_y_with_language():
+    from audio_vad import speech_segments_to_ranges
+
+    seg = vad.SpeechSegment(12.25, 13.5).with_language("it")
+    assert seg.language == "it"
+    assert seg.to_dict()["language"] == "it"
+    ranges = speech_segments_to_ranges([seg])
+    assert ranges == [(12250, 13500)]
+
+
+# ---------------------------------------------------------------------------
+# 6) Backend ONNX puro (sin torch) - inferencia con onnxruntime + numpy
+# ---------------------------------------------------------------------------
+def test_probs_to_speech_segments_ms_basico():
+    from audio_vad_onnx import probs_to_speech_segments_ms
+
+    # 32 ms por ventana: 5 de voz, 5 de silencio, 10 de voz (segundo bloque > 250 ms)
+    probs = ([0.9] * 5 + [0.05] * 5 + [0.9] * 10)
+    segments = probs_to_speech_segments_ms(
+        probs, window_ms=32.0, threshold=0.5, neg_threshold=0.35,
+        min_speech_duration_ms=250, min_silence_duration_ms=100,
+    )
+    assert len(segments) == 2
+    s1, s2 = segments
+    assert abs(s1[0] - 0.0) < 1e-6                    # arranca en 0
+    assert abs(s1[1]) >= 250                          # duración mínima cumplida
+    assert abs(s2[0] - 320.0) < 1e-6                  # se reanuda tras el silencio
+    assert s2[0] > s1[1]
+
+
+def test_probs_to_speech_segments_ms_filtra_rapagas_cortas():
+    from audio_vad_onnx import probs_to_speech_segments_ms
+
+    probs = [0.9, 0.9, 0.05, 0.05, 0.9]  # ráfagas de 64 ms: < 250 ms
+    segments = probs_to_speech_segments_ms(
+        probs, window_ms=32.0, threshold=0.5, neg_threshold=0.35,
+        min_speech_duration_ms=250, min_silence_duration_ms=100,
+    )
+    assert segments == []
+
+
+def test_resolve_onnx_model_path_devuelve_fichero():
+    from audio_vad_onnx import resolve_onnx_model_path
+
+    path = resolve_onnx_model_path()
+    assert os.path.isfile(path)
+    assert path.endswith("silero_vad.onnx")
+
+
+def test_onnx_detect_speech_segments_audio_real_paridad(tmp_path):
+    """El backend ONNX puro detecta voz en audio real (paridad con torch si está)."""
+    from audio_vad_onnx import detect_speech_segments_onnx
+
+    src = tmp_path / "en.wav"
+    try:
+        urllib.request.urlretrieve(
+            "https://models.silero.ai/vad_models/en.wav", str(src)
+        )
+    except Exception as exc:  # noqa: BLE001 - sin red: omitimos
+        pytest.skip(f"No se pudo descargar el ejemplo oficial: {exc}")
+
+    normalized = tmp_path / "en_normalized.wav"
+    preprocess_audio_base(src, normalized)
+
+    segs_onnx = detect_speech_segments_onnx(normalized)
+    assert len(segs_onnx) >= 1
+    cov_onnx = sum(s.duration for s in segs_onnx)
+
+    # Si hay backend torch (o bien el ONNX vía detect_speech_segments), comparamos.
+    try:
+        segs_other = vad.detect_speech_segments(normalized)
+    except Exception:  # noqa: BLE001 - sin torch ni onnx: no hay comparación posible
+        segs_other = []
+    if segs_other:
+        cov_other = sum(s.duration for s in segs_other)
+        # Misma voz detectada: cobertura equivalente (grano de 32 ms)
+        assert cov_onnx > 0.5 * cov_other
+        assert cov_onnx < 2.0 * cov_other

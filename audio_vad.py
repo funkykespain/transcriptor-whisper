@@ -21,6 +21,7 @@ a ambos lados) para cumplir exactamente el requisito de 400 ms por lado.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import wave
 from dataclasses import dataclass
@@ -44,10 +45,16 @@ class VadError(RuntimeError):
 
 @dataclass(frozen=True)
 class SpeechSegment:
-    """Tramo de voz detectado, en segundos (puede incluir el padding)."""
+    """Tramo de voz detectado, en segundos (puede incluir el padding).
+
+    ``language`` (opcional) es el hint preparado para la Fase 4 (LID): la ASR
+    podrá forzar ``language='es'`` o ``language='it'`` por segmento según el
+    idioma detectado en cada tramo.
+    """
 
     start: float
     end: float
+    language: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.start < 0 or self.end < self.start:
@@ -60,19 +67,26 @@ class SpeechSegment:
         """Duración del tramo en segundos."""
         return self.end - self.start
 
-    def to_dict(self) -> Dict[str, float]:
+    def to_dict(self) -> Dict[str, object]:
         """Estructura serializable con timestamps en segundos y milisegundos."""
-        return {
+        data: Dict[str, object] = {
             "start": round(self.start, 4),
             "end": round(self.end, 4),
             "duration": round(self.duration, 4),
             "start_ms": int(round(self.start * 1000)),
             "end_ms": int(round(self.end * 1000)),
         }
+        if self.language is not None:
+            data["language"] = self.language
+        return data
 
     def to_ms(self) -> Tuple[int, int]:
         """Devuelve (inicio_ms, fin_ms) para integrar con pydub etc."""
         return self.to_dict()["start_ms"], self.to_dict()["end_ms"]
+
+    def with_language(self, language: str) -> "SpeechSegment":
+        """Devuelve una copia del segmento anotada con el idioma (Fase 4/LID)."""
+        return SpeechSegment(start=self.start, end=self.end, language=language)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +113,65 @@ def get_vad_model():
             ) from exc
         _vad_model = load_silero_vad()
     return _vad_model
+
+
+# ---------------------------------------------------------------------------
+# Selección de backend (torch+silero-vad o ONNX puro sin torch)
+# ---------------------------------------------------------------------------
+_vad_backend: Optional[str] = None
+
+
+def _select_backend() -> str:
+    """Elige el backend VAD: ``"torch"`` (por defecto) u ``"onnx"``.
+
+    * Variable de entorno ``AUDIO_VAD_BACKEND`` (``torch``|``onnx``) fuerza
+      el backend (así se usa en producción ARM/Docker sin torch).
+    * Auto: usa ``torch`` si ``silero-vad`` está completo; si no, cae al
+      backend ONNX puro (:mod:`audio_vad_onnx`, solo onnxruntime + numpy).
+    """
+    global _vad_backend
+    if _vad_backend is not None:
+        return _vad_backend
+
+    forced = os.environ.get("AUDIO_VAD_BACKEND", "").strip().lower()
+    if forced:
+        if forced in ("torch", "pytorch"):
+            get_vad_model()  # valida que el backend torch es usable
+            _vad_backend = "torch"
+        elif forced in ("onnx", "onnxruntime"):
+            _require_onnx()
+            _vad_backend = "onnx"
+        else:
+            raise VadError(
+                f"AUDIO_VAD_BACKEND inválido: {forced!r} (esperado 'torch' u 'onnx')"
+            )
+        return _vad_backend
+
+    if importlib.util.find_spec("silero_vad") is not None:
+        try:
+            get_vad_model()
+            _vad_backend = "torch"
+            return _vad_backend
+        except VadError:
+            pass  # silero-vad sin torch (install --no-deps): cae a ONNX
+    _require_onnx()
+    _vad_backend = "onnx"
+    return _vad_backend
+
+
+def _require_onnx() -> None:
+    """Valida la disponibilidad del backend ONNX o lanza :class:`VadError`."""
+    try:
+        from audio_vad_onnx import get_onnx_session
+
+        get_onnx_session()
+    except VadError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise VadError(
+            "Ningún backend VAD disponible: falta 'silero-vad' (+ torch) y "
+            "falla también onnxruntime/el modelo ONNX."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +298,20 @@ def detect_speech_segments(
         # Audio más corto que la ventana mínima de inferencia de Silero: sin voz.
         return []
 
+    backend = _select_backend()
+    if backend == "onnx":
+        from audio_vad_onnx import detect_speech_segments_onnx
+
+        return detect_speech_segments_onnx(
+            input_path,
+            sampling_rate=sampling_rate,
+            threshold=threshold,
+            min_speech_duration_ms=min_speech_duration_ms,
+            min_silence_duration_ms=min_silence_duration_ms,
+            speech_pad_ms=speech_pad_ms,
+            max_speech_duration_s=max_speech_duration_s,
+        )
+
     model = get_vad_model()
     try:
         from silero_vad import get_speech_timestamps
@@ -253,6 +340,19 @@ def detect_speech_segments(
 def segments_to_dicts(segments: Sequence[SpeechSegment]) -> List[Dict[str, float]]:
     """Serializa los segmentos a la estructura JSON `[{start, end, ...}, ...]`."""
     return [segment.to_dict() for segment in segments]
+
+
+def speech_segments_to_ranges(
+    segments: Sequence[SpeechSegment],
+) -> List[Tuple[int, int]]:
+    """Convierte segmentos a intervalos ``(start_ms, end_ms)``.
+
+    Los timestamps son **relativos al audio de entrada completo** (tanto el
+    original como el normalizado tienen la misma duración), de modo que se
+    pueden usar directamente para cortar/transcribir el audio original y para
+    sincronizar el texto con los segundos exactos del examen.
+    """
+    return [segment.to_ms() for segment in segments]
 
 
 def cut_speech_chunk(
