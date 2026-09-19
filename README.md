@@ -144,6 +144,21 @@ pip install -r requirements.txt
 | `AUDIO_VAD_BACKEND` | `onnx` (por defecto en Docker, sin torch) o `torch`. Si no se define, el sistema usa `torch` si está disponible y cae a `onnx` si no. |
 | `SILERO_VAD_ONNX_PATH` | Ruta alternativa al `silero_vad.onnx` (por defecto usa el empaquetado). |
 
+### 🌐 Detección de idioma por segmento (Fase 4 - LID)
+
+Antes de transcribir cada fragmento se detecta su idioma con el **selector de
+idioma nativo de Whisper** (`faster-whisper`, modelo `tiny` en CPU, ≈75 MB) y
+ese idioma se fuerza en la llamada ASR (inyectado en el prompt forense; con
+una ASR local se pasaría como `language=...`). Si la confianza no supera el
+umbral, se usa el idioma por defecto (comportamiento seguro):
+
+| Variable | Efecto |
+| :--- | :--- |
+| `ASR_LID_MODEL` | Tamaño del modelo Whisper para LID (`tiny` por defecto; opciones: `base`, `small`, o una ruta con el modelo precargado). |
+| `ASR_LID_MODEL_DIR` | Carpeta del modelo ya descargado (opcional, evita descarga en runtime). |
+| `ASR_LID_CONFIDENCE_THRESHOLD` | Umbral de confianza del LID (por defecto `0.5`). Por debajo → fallback. |
+| `ASR_DEFAULT_LANGUAGE` | Idioma por defecto/fallback (por defecto `es`). |
+
 ---
 
 ## 💻 Ejecución Local (Desarrollo)

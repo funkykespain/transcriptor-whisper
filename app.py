@@ -18,6 +18,11 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from audio_preprocessing import preprocess_audio_base
+from audio_lid import (
+    DEFAULT_LANGUAGE,
+    detect_language_for_segment,
+    load_audio_array,
+)
 from audio_vad import (
     detect_speech_segments,
     export_speech_chunks,
@@ -233,14 +238,15 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
         else: return "IDIOMA_B", "XX"
     except: return "DESCONOCIDO", "XX"
 
-def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str, language_hint: str = "auto") -> dict:
+def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str, forced_language: str = "") -> dict:
     # 1. Normalización
     b64_audio = audio_to_base64(normalizar_audio(segment_audio))
-    # TODO(Fase 4 - LID): con ASR local (Whisper) se forzará
-    # language=language_hint ('es' | 'it' | ...) según el idioma de cada
-    # segmento, manteniendo cada chunk con su timestamp relativo al original.
-    if language_hint != "auto":
-        logger.debug("language_hint del segmento: %s", language_hint)
+    # Fase 4 (LID): `forced_language` es el ISO detectado por audio_lid
+    # ('es' | 'it' | ...) para este fragmento. Con una ASR local (Whisper) se
+    # pasaría directamente como language=forced_language; aquí se inyecta al
+    # prompt pericial a continuación para impedir alucinaciones/traducciones.
+    if forced_language:
+        logger.debug("LID forzado del segmento: %s", forced_language)
     
     # 2. Prompt Forense General (Principios Periciales Universales)
     prompt_sistema = f"""
@@ -272,6 +278,14 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
 
     Output: {{"idioma": "ES" o "{lengua_b_iso}", "texto": "..."}}
     """
+
+    # Fase 4 (LID): fuerza el idioma detectado por audio_lid en ESTE fragmento.
+    if forced_language:
+        prompt_sistema += (
+            f'\n    LID DEL FRAGMENTO: el idioma detectado por LID es "{forced_language.upper()}".\n'
+            "    Regla FORZADA: transcribe este fragmento literalmente en ese idioma;\n"
+            "    está terminantemente prohibido traducirlo o cambiar de idioma.\n"
+        )
 
     try:
         response = client.chat.completions.create(
@@ -486,6 +500,15 @@ if uploaded_file:
                 if not chunks: st.error("❌ Audio vacío o irreconocible."); st.stop()
                 st.write(f"✅ {len(chunks)} intervenciones localizadas.")
                 
+                # Fase 4 (LID): array normalizado 16k para detectar el idioma
+                # de cada tramo sobre los primeros segundos del segmento.
+                lid_audio = None
+                if segments_vad:
+                    try:
+                        lid_audio = load_audio_array(audio_norm_path)
+                    except Exception:
+                        logger.warning("LID: no se pudo cargar el audio normalizado.", exc_info=True)
+                
                 st.write("🌍 Identificando idioma...")
                 collage = crear_collage_audio(audio_total, chunks)
                 nombre_lb, iso_lb = detectar_lengua_b(client, collage)
@@ -508,11 +531,19 @@ if uploaded_file:
                     # con los segundos exactos del examen.
                     seg = audio_total[start:min(end, len(audio_total))]
                     
-                    # Fase 4 (LID) preparado: idioma forzado que recibirá la ASR
-                    # por segmento (language='es' | 'it' | ... según el tramo).
-                    language_hint = "es" if idioma_actual == "ES" else iso_lb.lower()
+                    # Fase 4 (LID): idioma forzado para la ASR por segmento.
+                    forced_language = DEFAULT_LANGUAGE
+                    if lid_audio is not None and segments_vad:
+                        forced_language, det = detect_language_for_segment(
+                            lid_audio, segments_vad[i], default=DEFAULT_LANGUAGE
+                        )
+                        if not det.is_confident():
+                            logger.debug(
+                                "LID con confianza baja (%s); fallback seguro a '%s'.",
+                                det.confidence, forced_language,
+                            )
                     
-                    dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual, language_hint=language_hint)
+                    dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual, forced_language=forced_language)
                     
                     texto_segmento = dat.get('texto','')
                     idioma_detectado = dat.get('idioma','??')
