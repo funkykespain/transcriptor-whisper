@@ -1,0 +1,6 @@
+# PyTorch CPU-only para servidores sin GPU (ARM Ampere A1, VPS aarch64, etc.).
+# Instala ANTES de requirements.txt para que pip no baje los wheels CUDA (>2 GB).
+# Más info: https://pytorch.org/get-started/locally/ -> CPU
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1+cpu
+torchaudio==2.9.1+cpu
