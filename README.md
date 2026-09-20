@@ -143,6 +143,25 @@ pip install -r requirements.txt
 | :--- | :--- |
 | `AUDIO_VAD_BACKEND` | `onnx` (por defecto en Docker, sin torch) o `torch`. Si no se define, el sistema usa `torch` si está disponible y cae a `onnx` si no. |
 | `SILERO_VAD_ONNX_PATH` | Ruta alternativa al `silero_vad.onnx` (por defecto usa el empaquetado). |
+| `AUDIO_VAD_ENERGY_MARGIN_DB` | Margen (dB) del **filtro de energía relativa anti "headphone bleed"**: descarta segmentos con energía RMS inferior a `hablante principal - margen` (por defecto `12` dB, rango recomendado 12-15). Irrelevante si se pasa `energy_margin_db=` explícito. |
+
+> 🎧 **Filtro de energía relativa:** el VAD detecta por defecto con `threshold=0.65`
+> y `min_speech_duration_ms=600` para ignorar destellos de audio filtrado. Después,
+> `filter_segments_by_relative_energy()` calcula el RMS (dBFS) de cada tramo sobre el
+> audio **sin loudnorm** (`convert_base_pcm`), estima al hablante principal con el
+> percentil 75 y descarta la voz lejana (p. ej. la del examinador que se filtra por
+> los auriculares) que quede > 12 dB por debajo. Es agnóstico a la ganancia y al
+> idioma porque trabaja con energía relativa.
+>
+> 🔇 **Puerta de ruido/expansor suave:** la Fase 1 aplica `agate=threshold=-32dB:
+> range=0.12:ratio=4` **antes de loudnorm** para reducir el ruido de fondo y las
+> fugas de bajo nivel sin tocar la voz (medido: −9.5 dB en contenido bajo −32 dBFS,
+> 0 dB en voz). Configurable en `audio_preprocessing.DEFAULT_GATE_*`.
+>
+> 🌐 **LID con contexto:** para tramos < 1.5 s o de baja confianza, `audio_lid.py`
+> amplía la ventana ±1 s con el audio circundante; si sigue sin superar el umbral,
+> **hereda el idioma del segmento anterior** (en lugar del fallback rígido).
+> Configurable con `MIN_CONTEXT_DURATION_S` / `CONTEXT_EXTRA_SECONDS`.
 
 ### 🌐 Detección de idioma por segmento (Fase 4 - LID)
 
@@ -158,6 +177,7 @@ umbral, se usa el idioma por defecto (comportamiento seguro):
 | `ASR_LID_MODEL_DIR` | Carpeta del modelo ya descargado (opcional, evita descarga en runtime). |
 | `ASR_LID_CONFIDENCE_THRESHOLD` | Umbral de confianza del LID (por defecto `0.5`). Por debajo → fallback. |
 | `ASR_DEFAULT_LANGUAGE` | Idioma por defecto/fallback (por defecto `es`). |
+| `ASR_ALLOWED_LANGUAGES` | Idiomas candidatos del LID (ISO-639-1, separados por coma; p. ej. `es,it,en`). Si está definido, el LID elige el idioma con mayor score **dentro de ese subconjunto** (filtra falsos positivos de idiomas raros/secundarios). Vacío/ausente = evaluación completa sobre todos los idiomas soportados. |
 
 ---
 

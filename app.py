@@ -17,15 +17,19 @@ from dotenv import load_dotenv
 # la app se lance desde otro directorio o entornos tipo AppTest/testing.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from audio_preprocessing import preprocess_audio_base
+from audio_preprocessing import convert_base_pcm, preprocess_audio_base
 from audio_lid import (
     DEFAULT_LANGUAGE,
     detect_language_for_segment,
     load_audio_array,
+    parse_allowed_languages,
 )
 from audio_vad import (
+    DEFAULT_MIN_SPEECH_DURATION_MS,
+    DEFAULT_THRESHOLD,
     detect_speech_segments,
     export_speech_chunks,
+    filter_segments_by_relative_energy,
     speech_segments_to_ranges,
 )
 
@@ -473,13 +477,28 @@ if uploaded_file:
                         fh.write(uploaded_file.getvalue())
                     audio_norm_path = os.path.join(tmp_work, "audio_normalizado.wav")
                     preprocess_audio_base(src_path, audio_norm_path)
+                    # Referencia de energía SIN loudnorm (solo paso alto ± puerta
+                    # de ruido): loudnorm comprime el rango dinámico y 'sube' la
+                    # voz lejana del examinador, enmascarando la fuga de
+                    # auriculares. El RMS del filtro se calcula sobre este audio.
+                    audio_energy_path = os.path.join(tmp_work, "audio_energia.wav")
+                    convert_base_pcm(src_path, audio_energy_path)
                     
                     # --- FASE 2: voz con Silero VAD + padding de 400 ms ---
                     st.write("✂️ Detectando intervenciones con Silero VAD (F2)...")
                     segments_vad = detect_speech_segments(
                         audio_norm_path,
-                        threshold=0.5,
+                        threshold=DEFAULT_THRESHOLD,
+                        min_speech_duration_ms=DEFAULT_MIN_SPEECH_DURATION_MS,
                         min_silence_duration_ms=st.session_state['min_silence_ms'],
+                    )
+                    # Filtro de energía relativa (anti "headphone bleed"): la voz
+                    # lejana del examinador amplificada queda por debajo del
+                    # hablante principal - margen y se descarta. Se mide sobre el
+                    # audio SIN loudnorm para no enmascarar el rango dinámico.
+                    # Configurable con AUDIO_VAD_ENERGY_MARGIN_DB (por defecto 12).
+                    segments_vad = filter_segments_by_relative_energy(
+                        audio_energy_path, segments_vad
                     )
                     # Timestamps (ms) relativos al audio original (misma duración)
                     chunks = speech_segments_to_ranges(segments_vad)
@@ -524,6 +543,10 @@ if uploaded_file:
                 # --- BUCLE CON CONTEXTO (Lógica V2.1.0) ---
                 historial_contexto = ""
                 idioma_actual = "ES"
+                idioma_anterior_lid = DEFAULT_LANGUAGE
+                # Lista de idiomas candidatos/globales (env ASR_ALLOWED_LANGUAGES).
+                # None/[] = el LID evalúa todos los idiomas soportados.
+                allowed_languages = parse_allowed_languages()
                 
                 for i, (start, end) in enumerate(chunks):
                     # Los tramos VAD ya incluyen el padding de 400 ms y son
@@ -531,17 +554,23 @@ if uploaded_file:
                     # con los segundos exactos del examen.
                     seg = audio_total[start:min(end, len(audio_total))]
                     
-                    # Fase 4 (LID): idioma forzado para la ASR por segmento.
+                    # Fase 4 (LID): idioma forzado para la ASR por segmento. Para tramos
+                    # cortos (<1.5 s) o de baja confianza se amplía la ventana
+                    # ±1 s; si sigue sin superar el umbral, se hereda el idioma
+                    # del segmento anterior (en vez del fallback rígido).
                     forced_language = DEFAULT_LANGUAGE
                     if lid_audio is not None and segments_vad:
                         forced_language, det = detect_language_for_segment(
-                            lid_audio, segments_vad[i], default=DEFAULT_LANGUAGE
+                            lid_audio, segments_vad[i], default=DEFAULT_LANGUAGE,
+                            inherit_previous=idioma_anterior_lid,
+                            allowed_languages=allowed_languages,
                         )
                         if not det.is_confident():
                             logger.debug(
-                                "LID con confianza baja (%s); fallback seguro a '%s'.",
+                                "LID con confianza baja (%s); heredado/anterior='%s'.",
                                 det.confidence, forced_language,
                             )
+                    idioma_anterior_lid = forced_language
                     
                     dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual, forced_language=forced_language)
                     

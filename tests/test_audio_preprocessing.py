@@ -18,6 +18,7 @@ import pytest
 from audio_preprocessing import (
     DEFAULT_SAMPLE_RATE,
     AudioPreprocessingError,
+    convert_base_pcm,
     preprocess_audio_base,
 )
 
@@ -191,3 +192,62 @@ def test_preprocess_audio_base_error_si_ffmpeg_ausente(tmp_path, monkeypatch):
     monkeypatch.setattr(ap.shutil, "which", lambda name: None)
     with pytest.raises(AudioPreprocessingError):
         ap.preprocess_audio_base(input_path, tmp_path / "out.wav")
+
+
+# ---------------------------------------------------------------------------
+# Puerta de ruido (agate) y referencia de energía SIN loudnorm
+# ---------------------------------------------------------------------------
+def _rms_db_region(path, start_s, end_s):
+    with wave.open(str(path), "rb") as wf:
+        sr = wf.getframerate()
+        data = wf.readframes(wf.getnframes())
+    samples = np.frombuffer(data, dtype="<i2").astype(np.float64) / 32768.0
+    region = samples[int(start_s * sr):int(end_s * sr)]
+    return 20.0 * np.log10(np.sqrt(np.mean(region ** 2)) + 1e-12)
+
+
+def _tono_puro(amp, freq, duration_s, sample_rate=16000):
+    t = np.arange(int(duration_s * sample_rate)) / sample_rate
+    return amp * np.sin(2 * np.pi * freq * t)
+
+
+def test_puerta_de_ruido_atenda_fuga_sin_tocar_la_voz(tmp_path):
+    """El expansor agate reduce el contenido bajo -32 dB y deja la voz intacta."""
+    sr = 16000
+    loud = _tono_puro(0.5, 500.0, 1.0, sr)     # voz  ≈ -9 dBFS  (> umbral)
+    bleed = _tono_puro(0.02, 550.0, 1.0, sr)   # fuga ≈ -37 dBFS (< umbral)
+    src = tmp_path / "in.wav"
+    _write_wav(src, np.concatenate([loud, bleed]), sample_rate=sr)
+
+    con_gate = tmp_path / "con_gate.wav"
+    sin_gate = tmp_path / "sin_gate.wav"
+    convert_base_pcm(src, con_gate, noise_gate=True)
+    convert_base_pcm(src, sin_gate, noise_gate=False)
+
+    # La voz no se toca (diferencia < 0.5 dB)
+    assert abs(_rms_db_region(con_gate, 0.0, 1.0) - _rms_db_region(sin_gate, 0.0, 1.0)) < 0.5
+    # La fuga bajo el umbral se atenúa >= 10 dB en estado estacionario
+    # (medido en los últimos 500 ms del tramo, tras el transitorio de release)
+    bleed_sin = _rms_db_region(sin_gate, 1.5, 2.0)
+    bleed_con = _rms_db_region(con_gate, 1.5, 2.0)
+    assert bleed_sin - bleed_con >= 10.0
+
+
+def test_convert_base_pcm_es_pcm_16k_mono_16_bit_sin_loudnorm(tmp_path):
+    """La referencia de energía es PCM 16 kHz/mono/16-bit (sin compresión)."""
+    sr = 44100
+    t = np.arange(int(2 * sr)) / sr
+    stereo = np.stack([
+        0.5 * np.sin(2 * np.pi * 440 * t),
+        0.5 * np.sin(2 * np.pi * 660 * t),
+    ], axis=1)
+    src = tmp_path / "stereo44k.wav"
+    _write_wav(src, stereo, sample_rate=sr, n_channels=2)
+
+    out = tmp_path / "energia.wav"
+    returned = convert_base_pcm(src, out)
+    assert str(returned) == str(out.resolve())
+    with wave.open(str(out), "rb") as wf:
+        assert wf.getframerate() == 16_000
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2

@@ -52,7 +52,32 @@ LID_MODEL_DIR: Optional[str] = os.getenv("ASR_LID_MODEL_DIR") or None
 #: Ventana de análisis de Whisper (el LID usa los primeros segundos del chunk).
 LID_FIRST_SECONDS: float = 30.0
 
+#: Duración mínima (s) a partir de la cual el LID se hace solo con el tramo;
+#: por debajo se amplía la ventana de análisis con el audio circundante.
+MIN_CONTEXT_DURATION_S: float = 1.5
+#: Segundos de audio circundante (a cada lado) que se añaden al tramo corto.
+CONTEXT_EXTRA_SECONDS: float = 1.0
+
+#: Variable de entorno con la lista de idiomas candidatos (ISO-639-1, comas).
+_ENV_ALLOWED_LANGUAGES: str = "ASR_ALLOWED_LANGUAGES"
+
 ArrayLike = Union[str, os.PathLike, np.ndarray]
+
+
+def parse_allowed_languages(value: Optional[str] = None) -> Optional[List[str]]:
+    """Parsea la lista de idiomas permitidos (códigos ISO, separados por coma).
+
+    Si no se pasa valor ni está definida ``ASR_ALLOWED_LANGUAGES``, devuelve
+    ``None`` (sin restricción: el LID evalúa todos los idiomas soportados).
+    """
+    if value is None:
+        value = os.getenv(_ENV_ALLOWED_LANGUAGES, "")
+    codes = [
+        normalize_iso(item)
+        for item in str(value).split(",")
+        if item and item.strip()
+    ]
+    return codes or None
 
 
 @dataclass(frozen=True)
@@ -196,40 +221,116 @@ def detect_language_for_segment(
     sampling_rate: int = 16_000,
     threshold: float = CONFIDENCE_THRESHOLD,
     default: str = DEFAULT_LANGUAGE,
+    context_window_s: float = CONTEXT_EXTRA_SECONDS,
+    inherit_previous: Optional[str] = None,
+    allowed_languages: Optional[Sequence[str]] = None,
 ) -> Tuple[str, LanguageDetection]:
-    """Detecta el idioma de un tramo concreto y devuelve (idioma, detección).
+    """Detecta el idioma de un tramo con suavizado contextual.
 
-    Corta el array según los límites del :class:`SpeechSegment` y, si la
-    confianza no supera ``threshold``, devuelve el idioma ``default``.
+    Estrategia (fragmentos cortos o de baja confianza LID):
+      * Si el tramo dura menos de ``MIN_CONTEXT_DURATION_S`` (1.5 s) o el
+        score (restringido a ``allowed_languages`` si está definido) no supera
+        ``threshold``, se **amplía la ventana de análisis** con
+        ``context_window_s`` segundos (±1 s) del audio circundante.
+      * Si la confianza sigue por debajo del umbral, se **hereda el idioma del
+        segmento anterior** (``inherit_previous``) en lugar de hacer un
+        fallback rígido al idioma por defecto.
+
+    Cuando ``allowed_languages`` no es None, se solicita al detector el mapa
+    de probabilidades completo (top-N mayor) para poder filtrar por las
+    claves del subconjunto permitido y elegir el mejor candidato de él.
+
+    Returns:
+        ``(idioma, detección)``: el idioma resuelto (ISO) y la última
+        :class:`LanguageDetection` (para registrar su confianza).
     """
     start_sample = min(len(audio_array), int(round(segment.start * sampling_rate)))
     end_sample = min(len(audio_array), int(round(segment.end * sampling_rate)))
     end_sample = max(start_sample, end_sample)
-    chunk = audio_array[start_sample:end_sample]
-    detection = detect_language(chunk, model=model, sampling_rate=sampling_rate)
-    language, _ = resolve_language(detection, threshold=threshold, default=default)
-    return language, detection
+
+    top_n = 99 if allowed_languages else 5
+    detection = detect_language(
+        audio_array[start_sample:end_sample], model=model,
+        sampling_rate=sampling_rate, top_n=top_n,
+    )
+    _, score = _restricted_best(detection, allowed_languages)
+    needs_context = (
+        segment.duration < MIN_CONTEXT_DURATION_S
+        or score < threshold
+    )
+    if needs_context and context_window_s > 0:
+        context_samples = int(round(context_window_s * sampling_rate))
+        context_start = max(0, start_sample - context_samples)
+        context_end = min(len(audio_array), end_sample + context_samples)
+        detection = detect_language(
+            audio_array[context_start:context_end],
+            model=model, sampling_rate=sampling_rate, top_n=top_n,
+        )
+
+    language, ok = resolve_language(
+        detection, threshold=threshold, default=default,
+        allowed_languages=allowed_languages,
+    )
+    if ok:
+        return normalize_iso(language), detection
+    if inherit_previous:
+        return normalize_iso(inherit_previous), detection
+    return normalize_iso(default), detection
 
 
 # ---------------------------------------------------------------------------
-# Umbral / fallback
+# Umbral / fallback / restricción de idiomas
 # ---------------------------------------------------------------------------
+def _restricted_best(
+    detection: LanguageDetection,
+    allowed_languages: Optional[Sequence[str]],
+) -> Tuple[Optional[str], float]:
+    """Mejor idioma (y score) limitado a ``allowed_languages``.
+
+    Con ``allowed_languages`` None/vacío devuelve el idioma global del
+    detector con su confianza (comportamiento por defecto). El resto de
+    idiomas (raros o secundarios) se descartan para evitar falsos positivos.
+    """
+    if not allowed_languages:
+        return detection.language or None, detection.confidence
+    allowed = {normalize_iso(code) for code in allowed_languages if code}
+    restricted = {
+        normalize_iso(code): float(score)
+        for code, score in detection.probabilities.items()
+        if normalize_iso(code) in allowed
+    }
+    if not restricted:
+        return None, 0.0
+    best = max(restricted, key=restricted.get)
+    return best, restricted[best]
+
+
 def resolve_language(
     detection: LanguageDetection,
     *,
     threshold: float = CONFIDENCE_THRESHOLD,
     default: str = DEFAULT_LANGUAGE,
+    allowed_languages: Optional[Sequence[str]] = None,
 ) -> Tuple[str, bool]:
-    """Aplica el umbral de confianza con fallback al idioma por defecto.
+    """Aplica el umbral de confianza (y la restricción de idiomas) con fallback.
+
+    Args:
+        detection: Resultado del detector (con ``probabilities`` completo).
+        threshold: Umbral de confianza para aceptar la detección.
+        default: Idioma por defecto cuando el LID no es concluyente.
+        allowed_languages: Códigos ISO candidatos. Si está definido, se
+            selecciona el idioma con mayor score DENTRO de ese subconjunto
+            (ignorando idiomas raros/secundarios). None/vacío = sin restricción.
 
     Returns:
-        ``(idioma, confianza_ok)``: si la confianza del idioma detectado es
-        inferior a ``threshold`` o la detección está vacía, se devuelve
+        ``(idioma, confianza_ok)``: si la confianza del idioma (restringido o
+        no) es inferior a ``threshold`` o no hay candidatos, se devuelve
         ``(default, False)`` (comportamiento seguro: la ASR usa el idioma
         global configurado o su autodetección).
     """
-    if detection.is_confident(threshold) and detection.language:
-        return normalize_iso(detection.language), True
+    language, score = _restricted_best(detection, allowed_languages)
+    if language and score >= threshold:
+        return normalize_iso(language), True
     return normalize_iso(default), False
 
 
@@ -244,20 +345,31 @@ def assign_languages(
     sampling_rate: int = 16_000,
     threshold: float = CONFIDENCE_THRESHOLD,
     default: str = DEFAULT_LANGUAGE,
+    allowed_languages: Optional[Sequence[str]] = None,
 ) -> List[SpeechSegment]:
     """Devuelve una copia de los segmentos con ``language`` asignado por LID.
 
     Si ``audio_array`` no se proporciona, los segmentos se anotan con el
     idioma por defecto (utilitario para flujos sin audio normalizado).
+
+    ``allowed_languages`` restringe los candidatos del LID (None/vacío =
+    evaluación completa sobre todos los idiomas soportados).
     """
     annotated: List[SpeechSegment] = []
+    previous_language: Optional[str] = None
     for segment in segments:
         if audio_array is None:
             annotated.append(segment.with_language(default))
+            previous_language = previous_language or default
             continue
-        language, _ = detect_language_for_segment(
+        language, detection = detect_language_for_segment(
             audio_array, segment, model=model,
             sampling_rate=sampling_rate, threshold=threshold, default=default,
+            inherit_previous=previous_language,
+            allowed_languages=allowed_languages,
         )
         annotated.append(segment.with_language(language))
+        # El idioma "anterior" pasa a ser el resuelto: así un tramo de baja
+        # confianza hereda la lengua del último tramo confiable.
+        previous_language = language
     return annotated
