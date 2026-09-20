@@ -154,16 +154,17 @@ def test_detect_language_for_segment_expande_ventana_contexto(monkeypatch):
 
 def test_detect_language_for_segment_hereda_idioma_anterior(monkeypatch):
     """Confianza baja persistente -> hereda el idioma del segmento anterior."""
-
     def fake_detect(audio, **kwargs):
         return LanguageDetection(language="fr", confidence=0.2)
 
     monkeypatch.setattr(lid, "detect_language", fake_detect)
     audio_array = np.zeros(16000 * 5, dtype=np.float32)
+    # Δt = 0.5 - 0.0 = 0.5 s < T_inertia: herencia activa
     lang, det = lid.detect_language_for_segment(
-        audio_array, SpeechSegment(0.5, 2.5), default="es", inherit_previous="it"
+        audio_array, SpeechSegment(0.5, 2.5), default="es",
+        previous_language="it", previous_end=0.0,
     )
-    assert lang == "it"          # herencia del segmento anterior
+    assert lang == "it"          # herencia del segmento anterior (Δt corto)
     assert not det.is_confident()
     # Sin anterior, cae al idioma por defecto
     lang2, _ = lid.detect_language_for_segment(
@@ -265,6 +266,63 @@ def test_allowed_languages_en_detect_language_for_segment(monkeypatch):
     )
     assert lang == "it"        # 0.25 es el máximo dentro de {"es", "it"}
     assert "it" in det.probabilities
+
+
+# ---------------------------------------------------------------------------
+# 5) Matriz de transición temporal (inercia según Δt)
+# ---------------------------------------------------------------------------
+def test_inercia_preserva_idioma_previo_si_dt_corto(monkeypatch):
+    """Con Δt < T_inertia, el sesgo hace ganar al idioma del segmento anterior."""
+    probabilities = {"es": 0.34, "it": 0.33, "fr": 0.33}   # ambiguo dentro de allowed
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.33, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 8, dtype=np.float32)
+    # segmento actual [3.0, 5.0]; anterior terminaba en 2.5 -> Δt = 0.5 s < 2.0
+    lang, det = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(3.0, 5.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.3,
+        previous_language="it", previous_end=2.5, context_window_s=0.0,
+    )
+    assert lang == "it"        # 0.33 + INERTIA_BIAS > 0.34 (sin sesgo ganaría 'es')
+
+
+def test_inercia_decae_a_cero_si_dt_largo(monkeypatch):
+    """Con Δt > T_inertia la evaluación es neutra y vence el candidato superior."""
+    probabilities = {"es": 0.34, "it": 0.33, "fr": 0.33}
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.33, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 8, dtype=np.float32)
+    # segmento actual [3.0, 5.0]; anterior terminaba en 0.0 -> Δt = 3.0 s ≥ 2.0
+    lang, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(3.0, 5.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.3,
+        previous_language="it", previous_end=0.0, context_window_s=0.0,
+    )
+    assert lang == "es"        # sin sesgo: 0.34 > 0.33
+
+
+def test_bias_por_inercia_temporal_directo():
+    det = LanguageDetection(
+        language="es", confidence=0.31,
+        probabilities={"es": 0.31, "it": 0.29},
+    )
+    sesgado = lid._bias_by_time_inertia(det, "it", delta_t=0.5)
+    assert sesgado.probabilities["it"] == pytest.approx(0.29 + lid.INERTIA_BIAS)
+    # Δt ≥ T_inertia (o sin idioma previo): probabilidades sin tocar
+    neutro = lid._bias_by_time_inertia(det, "it", delta_t=lid.T_INERTIA_S + 1.0)
+    assert neutro.probabilities == det.probabilities
+    sin_previo = lid._bias_by_time_inertia(det, None, delta_t=0.5)
+    assert sin_previo.probabilities == det.probabilities
 
 
 def test_detect_language_formato_no_normalizado_lanza(tmp_path):
