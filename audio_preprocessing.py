@@ -71,6 +71,16 @@ DEFAULT_TARGET_LUFS: float = -18.0          # EBU R128 integrated loudness
 DEFAULT_LRA_TARGET: float = 11.0            # Loudness Range (voz/diálogo)
 DEFAULT_TRUE_PEAK_DB: float = -1.5          # True peak pico máximo seguro ASR
 
+# --- Puerta de ruido / expansor suave (agate) ANTES de loudnorm -------------
+# Reduce el ruido de fondo y las fugas de bajo nivel (headphone bleed) antes
+# de que loudnorm los 'suba'. threshold en dB (FFmpeg acepta sufijo dB),
+# range 0..1 (reducción máxima, 0.12 ≈ -18 dB nominal / ~-9 dB medidos 1:1).
+DEFAULT_GATE_THRESHOLD_DB: float = -32.0
+DEFAULT_GATE_RANGE: float = 0.12
+DEFAULT_GATE_RATIO: float = 4.0
+DEFAULT_GATE_ATTACK_MS: float = 20.0
+DEFAULT_GATE_RELEASE_MS: float = 250.0
+
 _MODE_SINGLE_PASS = "single"
 _MODE_TWO_PASS = "two_pass"
 _VALID_MODES = (_MODE_SINGLE_PASS, _MODE_TWO_PASS)
@@ -121,6 +131,23 @@ def _loudnorm_filter(
     return "loudnorm=" + ":".join(parts)
 
 
+def _noise_gate_filter() -> str:
+    """Filtro ``agate`` (expansor/puerta suave) contra fuga de auriculares.
+
+    Se aplica ANTES de loudnorm para atenuar el contenido bajo el umbral
+    (ruido de fondo, voz lejana del examinador) sin afectar a la voz cercana:
+    medido con FFmpeg 8.0.1, un tono a -37 dBFS se reduce ~9.5 dB mientras que
+    la señales sobre -32 dBFS pasan intactas (0.0 dB).
+    """
+    return (
+        f"agate=threshold={DEFAULT_GATE_THRESHOLD_DB:.0f}dB"
+        f":range={DEFAULT_GATE_RANGE:g}"
+        f":ratio={DEFAULT_GATE_RATIO:g}"
+        f":attack={DEFAULT_GATE_ATTACK_MS:g}"
+        f":release={DEFAULT_GATE_RELEASE_MS:g}"
+    )
+
+
 def _parse_loudnorm_stats(stderr: str) -> Dict[str, float]:
     """Extrae el JSON de medición de ``loudnorm=print_format=json`` (stderr)."""
     idx = stderr.find('"input_i"')
@@ -148,16 +175,21 @@ def _convert_command(
     highpass_hz: float,
     sample_rate: int,
     channels: int,
+    noise_gate: bool = True,
 ) -> list:
     """Etapa 1: convierte a PCM (``sample_rate``/``channels``/16-bit) y filtra.
 
-    Sin ``loudnorm`` de por medio, ``-ar``/``-ac`` se aplican de forma estable
-    tras el filtro paso alto, sin reordenamientos del optimizador de FFmpeg.
+    Cadena: ``highpass`` (+ puerta de ruido ``agate``) y después re-muestreo y
+    downmix. Sin ``loudnorm`` de por medio, ``-ar``/``-ac`` se aplican de forma
+    estable tras el filtro, sin reordenamientos del optimizador de FFmpeg.
     """
+    af = f"highpass=f={highpass_hz:g}"
+    if noise_gate:
+        af += f",{_noise_gate_filter()}"
     return [
         binary, "-hide_banner", "-nostdin", "-y",
         "-i", str(input_path),
-        "-af", f"highpass=f={highpass_hz:g}",
+        "-af", af,
         "-ar", str(sample_rate),
         "-ac", str(channels),
         "-c:a", DEFAULT_SAMPLE_FORMAT,
@@ -326,6 +358,52 @@ def preprocess_audio_base(
         except OSError:
             pass
 
+    if not os.path.isfile(absolute_output):
+        raise AudioPreprocessingError(
+            f"FFmpeg terminó pero no generó la salida esperada: {absolute_output}"
+        )
+    return absolute_output
+
+
+def convert_base_pcm(
+    input_path: PathLike,
+    output_path: PathLike,
+    *,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
+    channels: int = DEFAULT_CHANNELS,
+    highpass_hz: float = DEFAULT_HIGHPASS_HZ,
+    noise_gate: bool = True,
+) -> str:
+    """Convierte a PCM 16 kHz/mono/16-bit + paso alto SIN compresión loudnorm.
+
+    Esta es la referencia de energía para
+    :func:`audio_vad.filter_segments_by_relative_energy`: loudnorm (EBU R128)
+    de la Fase 1 comprime el rango dinámico y 'sube' la voz lejana del
+    examinador, enmascarando la fuga de auriculares. Esta variante aplica solo
+    el paso alto a 80 Hz y la puerta de ruido (opcional), preservando la
+    energía relativa de cada tramo de voz.
+
+    Returns:
+        La ruta absoluta de ``output_path`` generado.
+    """
+    binary = _find_ffmpeg()
+    absolute_output = os.path.abspath(output_path)
+    out_dir = os.path.dirname(absolute_output)
+    if not os.path.isdir(out_dir):
+        raise AudioPreprocessingError(f"El directorio de salida no existe: {out_dir}")
+
+    proc = subprocess.run(
+        _convert_command(
+            binary, input_path, absolute_output, highpass_hz, sample_rate, channels,
+            noise_gate=noise_gate,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise AudioPreprocessingError(
+            f"FFmpeg falló al convertir '{input_path}':\n{proc.stderr[-2000:]}"
+        )
     if not os.path.isfile(absolute_output):
         raise AudioPreprocessingError(
             f"FFmpeg terminó pero no generó la salida esperada: {absolute_output}"

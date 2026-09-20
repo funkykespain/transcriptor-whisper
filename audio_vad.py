@@ -22,6 +22,7 @@ a ambos lados) para cumplir exactamente el requisito de 400 ms por lado.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import wave
 from dataclasses import dataclass
@@ -29,12 +30,20 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_SAMPLE_RATE: int = 16_000              # Tasa del audio normalizado (Fase 1)
-DEFAULT_THRESHOLD: float = 0.5                 # Umbral de probabilidad de voz
-DEFAULT_MIN_SPEECH_DURATION_MS: int = 250      # Ignora ráfagas < 250 ms
+DEFAULT_THRESHOLD: float = 0.65                # Umbral de voz (0.65: mitiga fuga de auriculares)
+DEFAULT_MIN_SPEECH_DURATION_MS: int = 600      # Ignora destellos breves de audio filtrado
 DEFAULT_MIN_SILENCE_DURATION_MS: int = 100     # Cierra el tramo tras 100 ms de silencio
 DEFAULT_SPEECH_PAD_MS: int = 400               # Padding antes y después de cada tramo
 _VAD_WINDOW_SAMPLES: int = 512                 # Ventana mínima Silero a 16 kHz
+
+# --- Filtro de energía relativa (anti "headphone bleed") --------------------
+DEFAULT_ENERGY_MARGIN_DB: float = 12.0         # Umbral: hablante principal - margen
+DEFAULT_ENERGY_PERCENTILE: int = 75            # Percentil que define al hablante principal
+_ENV_ENERGY_MARGIN_DB: str = "AUDIO_VAD_ENERGY_MARGIN_DB"
+_DBFS_FLOOR_DB: float = -120.0                 # Piso para segmentos en silencio
 
 PathLike = Union[str, os.PathLike]
 
@@ -353,6 +362,126 @@ def speech_segments_to_ranges(
     sincronizar el texto con los segundos exactos del examen.
     """
     return [segment.to_ms() for segment in segments]
+
+
+# ---------------------------------------------------------------------------
+# Filtro de energía relativa adaptativa (anti "headphone bleed")
+# ---------------------------------------------------------------------------
+def segment_rms_db(
+    samples: np.ndarray,
+    start_sample: int,
+    end_sample: int,
+) -> float:
+    """Devuelve el RMS del tramo en dBFS (referencia 0 dBFS = int16 completo).
+
+    Se aplica un piso de ``_DBFS_FLOOR_DB`` (-120 dBFS) para que los tramos
+    en silencio sean comparables numéricamente en vez de devolver -inf.
+    """
+    chunk = samples[start_sample:end_sample].astype(np.float64)
+    if chunk.size == 0:
+        return _DBFS_FLOOR_DB
+    rms = float(np.sqrt(np.mean(chunk * chunk)))
+    if rms <= 1e-12:
+        return _DBFS_FLOOR_DB
+    return float(20.0 * np.log10(rms / 32768.0))
+
+
+def compute_segments_energy_db(
+    energy_audio_path: PathLike,
+    segments: Sequence[SpeechSegment],
+    *,
+    sampling_rate: int = DEFAULT_SAMPLE_RATE,
+) -> List[float]:
+    """Calcula el RMS (dBFS) de cada uno de los segmentos de voz.
+
+    Args:
+        energy_audio_path: WAV PCM 16 kHz/mono/16-bit de referencia de energía.
+            IMPORTANTE: debe ser el audio **sin compresión loudnorm** (p. ej.
+            la salida de :func:`audio_preprocessing.convert_base_pcm`, solo
+            paso alto 80 Hz ± puerta de ruido); con loudnorm el rango dinámico
+            se comprime y la voz lejana del examinador queda enmascarada.
+        segments: Tramos de voz a medir.
+
+    Returns:
+        Lista paralela a ``segments`` con la energía RMS de cada tramo en dBFS.
+    """
+    samples = _read_pcm_samples(energy_audio_path, sampling_rate)
+    energies: List[float] = []
+    for segment in segments:
+        start_sample = min(len(samples), int(round(segment.start * sampling_rate)))
+        end_sample = min(len(samples), int(round(segment.end * sampling_rate)))
+        end_sample = max(start_sample, end_sample)
+        energies.append(segment_rms_db(samples, start_sample, end_sample))
+    return energies
+
+
+def filter_segments_by_relative_energy(
+    energy_audio_path: PathLike,
+    segments: Sequence[SpeechSegment],
+    *,
+    energy_margin_db: Optional[float] = None,
+    energy_percentile: int = DEFAULT_ENERGY_PERCENTILE,
+    sampling_rate: int = DEFAULT_SAMPLE_RATE,
+) -> List[SpeechSegment]:
+    """Descarta segmentos cuya energía esté muy por debajo del hablante principal.
+
+    Pensado para grabaciones reales con **fuga de auriculares (headphone
+    bleed)**: la voz lejana del examinador llega amplificada y muy por debajo
+    del hablante principal. El filtro es **agnóstico al nivel de ganancia y al
+    idioma** porque trabaja sobre la energía relativa:
+
+    1. Calcula el RMS (dBFS) de cada segmento sobre el audio de referencia
+       ``energy_audio_path`` (RAW / solo paso alto 80 Hz, SIN loudnorm).
+    2. Estima la energía del hablante principal con el percentil
+       ``energy_percentile`` (por defecto 75-80) de la lista de RMS.
+    3. Descarta los segmentos con ``rms < hablante_principal - energy_margin_db``.
+
+    Args:
+        energy_audio_path: WAV PCM 16 kHz/mono/16-bit de referencia de energía.
+            Debe ser el audio **sin loudnorm** (salida de
+            :func:`audio_preprocessing.convert_base_pcm`) para preservar el
+            rango dinámico original.
+        segments: Segmentos detectados por el VAD (ya con padding).
+        energy_margin_db: Margen mínimo (dB) respecto al hablante principal;
+            por defecto ``DEFAULT_ENERGY_MARGIN_DB`` (12 dB, recomendado 10-12)
+            o la variable de entorno ``AUDIO_VAD_ENERGY_MARGIN_DB`` si está.
+        energy_percentile: Percentil (0-100) de la energía que representa al
+            hablante principal (por defecto 75).
+        sampling_rate: Tasa del audio de entrada.
+
+    Returns:
+        Lista de :class:`SpeechSegment` conservados (solo los energéticos).
+        Si el filtro eliminara todos los tramos, se conserva el de mayor
+        energía para no dejar el acta vacía.
+    """
+    if energy_margin_db is None:
+        raw_margin = os.getenv(_ENV_ENERGY_MARGIN_DB, "").strip()
+        energy_margin_db = float(raw_margin) if raw_margin else DEFAULT_ENERGY_MARGIN_DB
+    if not 0 <= energy_percentile <= 100:
+        raise ValueError(f"energy_percentile debe estar entre 0 y 100: {energy_percentile}")
+
+    segments = list(segments)
+    if not segments:
+        return []
+
+    energies = compute_segments_energy_db(energy_audio_path, segments, sampling_rate=sampling_rate)
+    main_speaker_energy_db = float(np.percentile(np.asarray(energies, dtype=np.float64), energy_percentile))
+    floor_db = main_speaker_energy_db - float(energy_margin_db)
+
+    kept = [seg for seg, energy in zip(segments, energies) if energy >= floor_db]
+    if not kept:
+        # Fallback de seguridad: conservar al menos al tramo con más energía.
+        logger.warning(
+            "El filtro de energía eliminó todos los tramos del audio '%s'; "
+            "se conserva el de mayor energía.", energy_audio_path,
+        )
+        kept = [segments[int(np.argmax(energies))]]
+
+    logger.debug(
+        "Filtro energía: hablante ≈ %.1f dBFS, umbral %.1f dBFS, conservados %d/%d",
+        main_speaker_energy_db, floor_db, len(kept), len(segments),
+    )
+    return kept
 
 
 def cut_speech_chunk(
