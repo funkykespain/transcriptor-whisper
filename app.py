@@ -544,6 +544,7 @@ if uploaded_file:
                 historial_contexto = ""
                 idioma_actual = "ES"
                 idioma_anterior_lid = DEFAULT_LANGUAGE
+                fin_segmento_anterior_s = None
                 # Lista de idiomas candidatos/globales (env ASR_ALLOWED_LANGUAGES).
                 # None/[] = el LID evalúa todos los idiomas soportados.
                 allowed_languages = parse_allowed_languages()
@@ -562,7 +563,8 @@ if uploaded_file:
                     if lid_audio is not None and segments_vad:
                         forced_language, det = detect_language_for_segment(
                             lid_audio, segments_vad[i], default=DEFAULT_LANGUAGE,
-                            inherit_previous=idioma_anterior_lid,
+                            previous_language=idioma_anterior_lid,
+                            previous_end=fin_segmento_anterior_s,
                             allowed_languages=allowed_languages,
                         )
                         if not det.is_confident():
@@ -571,6 +573,7 @@ if uploaded_file:
                                 det.confidence, forced_language,
                             )
                     idioma_anterior_lid = forced_language
+                    fin_segmento_anterior_s = segments_vad[i].end if segments_vad else None
                     
                     dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual, forced_language=forced_language)
                     

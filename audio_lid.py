@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -57,6 +57,14 @@ LID_FIRST_SECONDS: float = 30.0
 MIN_CONTEXT_DURATION_S: float = 1.5
 #: Segundos de audio circundante (a cada lado) que se añaden al tramo corto.
 CONTEXT_EXTRA_SECONDS: float = 1.0
+
+# --- Matriz de transición temporal (inercia de idioma según el silencio) -------
+#: Ventana de inercia ``T_inertia`` (s): si el intervalo de silencio entre el
+#: segmento anterior y el actual es menor, se premia al idioma precedente.
+T_INERTIA_S: float = float(os.getenv("ASR_LID_T_INERTIA", "2.0"))
+#: Bonificación suave (inertia bias) sumada a la probabilidad del idioma del
+#: segmento anterior antes de seleccionar el máximo dentro de allowed_languages.
+INERTIA_BIAS: float = float(os.getenv("ASR_LID_INERTIA_BIAS", "0.15"))
 
 #: Variable de entorno con la lista de idiomas candidatos (ISO-639-1, comas).
 _ENV_ALLOWED_LANGUAGES: str = "ASR_ALLOWED_LANGUAGES"
@@ -222,19 +230,26 @@ def detect_language_for_segment(
     threshold: float = CONFIDENCE_THRESHOLD,
     default: str = DEFAULT_LANGUAGE,
     context_window_s: float = CONTEXT_EXTRA_SECONDS,
-    inherit_previous: Optional[str] = None,
+    previous_language: Optional[str] = None,
+    previous_end: Optional[float] = None,
     allowed_languages: Optional[Sequence[str]] = None,
 ) -> Tuple[str, LanguageDetection]:
-    """Detecta el idioma de un tramo con suavizado contextual.
+    """Detecta el idioma de un tramo con suavizado contextual e inercia temporal.
 
     Estrategia (fragmentos cortos o de baja confianza LID):
       * Si el tramo dura menos de ``MIN_CONTEXT_DURATION_S`` (1.5 s) o el
         score (restringido a ``allowed_languages`` si está definido) no supera
         ``threshold``, se **amplía la ventana de análisis** con
         ``context_window_s`` segundos (±1 s) del audio circundante.
+      * **Inercia temporal:** si ``previous_end`` es conocido, se calcula el
+        intervalo de silencio ``Δt = segment.start − previous_end``. Con
+        ``Δt < T_INERTIA_S`` se suma ``INERTIA_BIAS`` a la probabilidad del
+        idioma anterior (``previous_language``) antes de elegir el máximo
+        dentro de ``allowed_languages``; con ``Δt ≥ T_INERTIA_S`` la inercia
+        se anula y la evaluación es neutra.
       * Si la confianza sigue por debajo del umbral, se **hereda el idioma del
-        segmento anterior** (``inherit_previous``) en lugar de hacer un
-        fallback rígido al idioma por defecto.
+        segmento anterior** si y solo si ``Δt < T_INERTIA_S`` (en silencios
+        largos se cae al idioma por defecto, sin inercia).
 
     Cuando ``allowed_languages`` no es None, se solicita al detector el mapa
     de probabilidades completo (top-N mayor) para poder filtrar por las
@@ -247,12 +262,14 @@ def detect_language_for_segment(
     start_sample = min(len(audio_array), int(round(segment.start * sampling_rate)))
     end_sample = min(len(audio_array), int(round(segment.end * sampling_rate)))
     end_sample = max(start_sample, end_sample)
+    delta_t = segment.start - previous_end if previous_end is not None else None
 
     top_n = 99 if allowed_languages else 5
     detection = detect_language(
         audio_array[start_sample:end_sample], model=model,
         sampling_rate=sampling_rate, top_n=top_n,
     )
+    detection = _bias_by_time_inertia(detection, previous_language, delta_t)
     _, score = _restricted_best(detection, allowed_languages)
     needs_context = (
         segment.duration < MIN_CONTEXT_DURATION_S
@@ -266,6 +283,7 @@ def detect_language_for_segment(
             audio_array[context_start:context_end],
             model=model, sampling_rate=sampling_rate, top_n=top_n,
         )
+        detection = _bias_by_time_inertia(detection, previous_language, delta_t)
 
     language, ok = resolve_language(
         detection, threshold=threshold, default=default,
@@ -273,14 +291,38 @@ def detect_language_for_segment(
     )
     if ok:
         return normalize_iso(language), detection
-    if inherit_previous:
-        return normalize_iso(inherit_previous), detection
+    iner_cadena_activa = previous_language is not None and delta_t is not None and delta_t < T_INERTIA_S
+    if iner_cadena_activa:
+        return normalize_iso(previous_language), detection
     return normalize_iso(default), detection
 
 
 # ---------------------------------------------------------------------------
 # Umbral / fallback / restricción de idiomas
 # ---------------------------------------------------------------------------
+def _bias_by_time_inertia(
+    detection: LanguageDetection,
+    previous_language: Optional[str],
+    delta_t: Optional[float],
+) -> LanguageDetection:
+    """Aplica el sesgo de inercia temporal a las probabilidades del detector.
+
+    Si ``delta_t`` (intervalo de silencio desde el segmento anterior) es
+    conocido y menor que ``T_INERTIA_S``, suma ``INERTIA_BIAS`` a la
+    probabilidad del idioma del segmento anterior antes de elegir el máximo
+    dentro de ``allowed_languages``. Si ``delta_t >= T_INERTIA_S`` (silencio
+    largo), devuelve las probabilidades sin tocar (inercia anulada).
+    """
+    if previous_language is None or delta_t is None or delta_t >= T_INERTIA_S:
+        return detection
+    if not detection.probabilities:
+        return detection
+    previous = normalize_iso(previous_language)
+    biased = dict(detection.probabilities)
+    biased[previous] = float(biased.get(previous, 0.0)) + INERTIA_BIAS
+    return replace(detection, probabilities=biased)
+
+
 def _restricted_best(
     detection: LanguageDetection,
     allowed_languages: Optional[Sequence[str]],
@@ -357,19 +399,23 @@ def assign_languages(
     """
     annotated: List[SpeechSegment] = []
     previous_language: Optional[str] = None
+    previous_segment: Optional[SpeechSegment] = None
     for segment in segments:
         if audio_array is None:
             annotated.append(segment.with_language(default))
             previous_language = previous_language or default
+            previous_segment = previous_segment or segment
             continue
         language, detection = detect_language_for_segment(
             audio_array, segment, model=model,
             sampling_rate=sampling_rate, threshold=threshold, default=default,
-            inherit_previous=previous_language,
+            previous_language=previous_language,
+            previous_end=previous_segment.end if previous_segment is not None else None,
             allowed_languages=allowed_languages,
         )
         annotated.append(segment.with_language(language))
-        # El idioma "anterior" pasa a ser el resuelto: así un tramo de baja
-        # confianza hereda la lengua del último tramo confiable.
+        # El idioma "anterior" pasa a ser el resuelto: así la inercia temporal
+        # (Δt < T_inertia) y la herencia operan sobre el último tramo tratado.
         previous_language = language
+        previous_segment = segment
     return annotated

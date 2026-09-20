@@ -178,6 +178,8 @@ umbral, se usa el idioma por defecto (comportamiento seguro):
 | `ASR_LID_CONFIDENCE_THRESHOLD` | Umbral de confianza del LID (por defecto `0.5`). Por debajo → fallback. |
 | `ASR_DEFAULT_LANGUAGE` | Idioma por defecto/fallback (por defecto `es`). |
 | `ASR_ALLOWED_LANGUAGES` | Idiomas candidatos del LID (ISO-639-1, separados por coma; p. ej. `es,it,en`). Si está definido, el LID elige el idioma con mayor score **dentro de ese subconjunto** (filtra falsos positivos de idiomas raros/secundarios). Vacío/ausente = evaluación completa sobre todos los idiomas soportados. |
+| `ASR_LID_T_INERTIA` | Ventana de inercia temporal `T_inertia` (s, por defecto `2.0`): si el intervalo de silencio entre segmentos consecutivos (`Δt`) es menor, se premia al idioma del segmento anterior. |
+| `ASR_LID_INERTIA_BIAS` | Bonificación suave sumada a la probabilidad del idioma anterior dentro de esa ventana (por defecto `0.15`); con `Δt ≥ T_inertia` la inercia se anula y la evaluación es neutra. |
 
 ---
 
