@@ -20,18 +20,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio_preprocessing import convert_base_pcm, preprocess_audio_base
 from audio_lid import (
     DEFAULT_LANGUAGE,
+    T_INERTIA_S,
     detect_language_for_segment,
+    detect_text_language,
     load_audio_array,
-    parse_allowed_languages,
 )
 from audio_vad import (
     DEFAULT_MIN_SPEECH_DURATION_MS,
     DEFAULT_THRESHOLD,
+    compute_segments_energy_db,
     detect_speech_segments,
     export_speech_chunks,
     filter_segments_by_relative_energy,
     speech_segments_to_ranges,
 )
+
+#: Filtro RMS estricto (pre-LLM): distancia mínima (dB) por debajo de la voz
+#: principal (mediana del RMS de los tramos) para DESCARTAR el fragmento por
+#: sangrado/auriculares sin ni siquiera enviarlo al LLM.
+ENERGY_STRICT_MARGIN_DB = float(os.getenv("ASR_ENERGY_STRICT_MARGIN_DB", "18"))
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +102,7 @@ st.markdown("""
 # ================= CONFIGURACIÓN DE IDIOMAS =================
 MAPA_ISO_IDIOMAS = {
     'HR': 'CROATA', 'HY': 'ARMENIO', 'KO': 'COREANO', 'EN': 'INGLÉS',
+    'ES': 'ESPAÑOL',
     'FR': 'FRANCÉS', 'IT': 'ITALIANO', 'DE': 'ALEMÁN', 'PT': 'PORTUGUÉS',
     'NL': 'NEERLANDÉS', 'SV': 'SUECO', 'DA': 'DANÉS', 'FI': 'FINLANDÉS',
     'NO': 'NORUEGO', 'IS': 'ISLANDÉS', 'RU': 'RUSO', 'PL': 'POLACO',
@@ -242,21 +250,49 @@ def detectar_lengua_b(client, audio_collage: AudioSegment) -> tuple:
         else: return "IDIOMA_B", "XX"
     except: return "DESCONOCIDO", "XX"
 
-def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str, forced_language: str = "") -> dict:
+def _directiva_idioma_objetivo(idioma_objetivo: str, iso_lb: str, nombre_lb: str) -> str:
+    """Directiva de transcripción guiada por el idioma objetivo (Paso B).
+
+    Universal y sin reglas por idioma:
+      * Si el objetivo es la Lengua B de la sesión, se fuerza su ortografía,
+        gramática y vocabulario (también ante pronunciación no nativa).
+      * Si no, se usa el idioma por defecto del sistema (``DEFAULT_LANGUAGE`` y
+        su nombre resuelto desde ``MAPA_ISO_IDIOMAS``).
+    """
+    if idioma_objetivo and idioma_objetivo.strip().lower() == str(iso_lb).strip().lower():
+        return (
+            f"El hablante está expresándose en {nombre_lb} ({iso_lb}). OBLIGATORIO: "
+            f"Transcribe el texto utilizando la ortografía, gramática y vocabulario de {nombre_lb}. "
+            f"Si la pronunciación del hablante es no nativa o castellanizada, mantén la palabra "
+            f"correspondiente en {nombre_lb} (no conviertas desinencias, plurales ni fonemas de "
+            f"{nombre_lb} al español)."
+        )
+    nombre_default = MAPA_ISO_IDIOMAS.get(DEFAULT_LANGUAGE.upper(), DEFAULT_LANGUAGE.upper()).capitalize()
+    return (
+        f"El hablante está expresándose en {nombre_default} ({DEFAULT_LANGUAGE}). "
+        f"Transcribe el texto en {nombre_default.lower()} literal."
+    )
+
+
+def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_nombre: str, lengua_b_iso: str, contexto_previo: str, idioma_previo: str, idioma_objetivo: str = "") -> dict:
     # 1. Normalización
+    # NOTA (arquitectura anti-traducción): la ASR se invoca SIN idioma forzado
+    # (no se pasa language=... a Whisper ni se inyecta 'forced_language' en el
+    # prompt). Así la transcripción es LITERAL en el idioma original hablado;
+    # la etiqueta final la decide después la clasificación híbrida audio+texto.
     b64_audio = audio_to_base64(normalizar_audio(segment_audio))
-    # Fase 4 (LID): `forced_language` es el ISO detectado por audio_lid
-    # ('es' | 'it' | ...) para este fragmento. Con una ASR local (Whisper) se
-    # pasaría directamente como language=forced_language; aquí se inyecta al
-    # prompt pericial a continuación para impedir alucinaciones/traducciones.
-    if forced_language:
-        logger.debug("LID forzado del segmento: %s", forced_language)
     
     # 2. Prompt Forense General (Principios Periciales Universales)
     prompt_sistema = f"""
     Eres un PERITO TRANSCRIPTOR FORENSE con especialización en análisis acústico y lingüístico multilingüe.
+    Transcripción bilingüe en castellano y {lengua_b_nombre} ({lengua_b_iso}). Transcribir literalmente las palabras pronunciadas sin traducir ni normalizar.
     Contexto: Examen de Interpretación Bilateral.
     Idiomas involucrados: ESPAÑOL (ES) y {lengua_b_nombre.upper()} ({lengua_b_iso}).
+
+    Esta grabación es bilingüe entre Español (ES) y {lengua_b_nombre} ({lengua_b_iso}).
+    Es habitual el "code-switching": el hablante puede empezar una frase en un idioma y
+    continuarla en el otro (o viceversa), incluso dentro del mismo fragmento de audio.
+    Transcribe TODAS las palabras reales sin normalizarlas hacia ninguno de los dos idiomas.
 
     MEMORIA PREVIA (solo referencia): "...{contexto_previo[-300:]}" - Idioma reportado en el fragmento anterior: {idioma_previo}
 
@@ -273,23 +309,36 @@ def transcribir_segmento_forense(client, segment_audio: AudioSegment, lengua_b_n
 
     c) DISCRIMINACIÓN DE RUIDO MECÁNICO:
        - Si el segmento solo contiene ruidos de fondo (paso de páginas, roces, tos) sin habla humana inteligible, devuelve únicamente el texto vacío "".
+       - SI EL AUDIO ES UN MURMULLO DISTANTE, SONIDO DE AURICULARES O SANGRADO DE FONDO DE BAJA INTENSIDAD (SIN VOZ PRINCIPAL CLARA): OBLIGATORIO DEVOLVER TEXTO VACÍO "". QUEDA PROHIBIDO TRANSCRIBIR VOZ SECUNDARIA O INVENTAR FRASES A PARTIR DE RUIDO.
 
     d) AISLAMIENTO DE MEMORIA:
        - Utiliza el contexto previo SOLO como referencia para resolver ambigüedades del fragmento actual.
        - Queda estrictamente prohibido traducir, repetir o incluir en la respuesta texto proveniente de la memoria previa que no corresponda al audio actual.
 
+    e) PROHIBICIÓN DE TRADUCCIÓN (REGLA UNIVERSAL):
+       - Transcribe de forma LITERAL y EXACTA las palabras pronunciadas en el audio.
+       - NUNCA traduzcas, adaptes ni normalices frases de un idioma a otro.
+       - Conserva el texto fielmente en el idioma en que fue hablado cada término.
+       - El "idioma" del JSON es solo una ETIQUETA informativa; nunca condiciona la transcripción.
+
+    f) RECONSTRUCCIÓN FONÉTICA DE ERRORES ASR (HABLANTE NO NATIVO):
+       - Si el ASR genera palabras deformadas o sin sentido propias de un hablante no nativo
+         (pronunciación dudosa o castellanizada), intenta RECONSTRUIR la palabra literal
+         original en la Lengua B ({lengua_b_nombre}) basándote en la fonética.
+       - NO traduzcas la frase entera al español ni inventes contenido: reconstruye solo la
+         palabra afectada y mantén el resto tal cual.
+
     FORMATO: Responde únicamente en JSON estricto.
 
-    Output: {{"idioma": "ES" o "{lengua_b_iso}", "texto": "..."}}
+    Output: {{"idioma": "idioma PREDOMINANTE del TEXTO REAL que has transcrito ('ES' o '{lengua_b_iso}'), aunque difiera de cualquier pista de audio previa", "texto": "..."}}
     """
 
-    # Fase 4 (LID): fuerza el idioma detectado por audio_lid en ESTE fragmento.
-    if forced_language:
-        prompt_sistema += (
-            f'\n    LID DEL FRAGMENTO: el idioma detectado por LID es "{forced_language.upper()}".\n'
-            "    Regla FORZADA: transcribe este fragmento literalmente en ese idioma;\n"
-            "    está terminantemente prohibido traducirlo o cambiar de idioma.\n"
-        )
+    # Paso B (pipeline en 2 fases): transcripción guiada por el idioma objetivo
+    # resuelto por el LID (audio + inercia + histéresis) para este fragmento.
+    if idioma_objetivo:
+        prompt_sistema += "\n    " + _directiva_idioma_objetivo(
+            idioma_objetivo, lengua_b_iso, lengua_b_nombre
+        ) + "\n"
 
     try:
         response = client.chat.completions.create(
@@ -500,6 +549,12 @@ if uploaded_file:
                     segments_vad = filter_segments_by_relative_energy(
                         audio_energy_path, segments_vad
                     )
+                    # Filtro RMS estricto (solo diagnóstico/metadata): se estima
+                    # la voz principal como la MEDIANA del RMS de los tramos.
+                    energias_tramos = compute_segments_energy_db(
+                        audio_energy_path, segments_vad
+                    ) if segments_vad else []
+                    voz_principal_db = float(np.median(energias_tramos)) if energias_tramos else None
                     # Timestamps (ms) relativos al audio original (misma duración)
                     chunks = speech_segments_to_ranges(segments_vad)
                     if segments_vad:
@@ -532,6 +587,15 @@ if uploaded_file:
                 collage = crear_collage_audio(audio_total, chunks)
                 nombre_lb, iso_lb = detectar_lengua_b(client, collage)
                 
+                # Restringir los candidatos del LID a ES + Lengua B detectada:
+                # evita falsos positivos de idiomas secundarios (p. ej. 'pt')
+                # sobre los 99 idiomas de Whisper. Si la Lengua B no se pudo
+                # detectar, se restringe solo a español (decisión segura).
+                if iso_lb and iso_lb.lower() not in {"xx", "??"}:
+                    allowed_languages = ["es", iso_lb.lower()]
+                else:
+                    allowed_languages = ["es"]
+                
                 st.write("📝 Transcribiendo con contexto inteligente...")
                 out_buf = io.StringIO()
                 out_buf.write(f"ALUMNO/EXAMEN: {uploaded_file.name}\n")
@@ -545,9 +609,8 @@ if uploaded_file:
                 idioma_actual = "ES"
                 idioma_anterior_lid = DEFAULT_LANGUAGE
                 fin_segmento_anterior_s = None
-                # Lista de idiomas candidatos/globales (env ASR_ALLOWED_LANGUAGES).
-                # None/[] = el LID evalúa todos los idiomas soportados.
-                allowed_languages = parse_allowed_languages()
+                # `allowed_languages` ya quedó restringido a ["es", iso_lb.lower()]
+                # tras detectar la Lengua B (definido más arriba).
                 
                 for i, (start, end) in enumerate(chunks):
                     # Los tramos VAD ya incluyen el padding de 400 ms y son
@@ -559,6 +622,8 @@ if uploaded_file:
                     # cortos (<1.5 s) o de baja confianza se amplía la ventana
                     # ±1 s; si sigue sin superar el umbral, se hereda el idioma
                     # del segmento anterior (en vez del fallback rígido).
+                    # ------------ PASO A: LID primero (audio + inercia + histéresis) ----------
+                    # Detecta el idioma del fragmento ANTES de transcribir.
                     forced_language = DEFAULT_LANGUAGE
                     if lid_audio is not None and segments_vad:
                         forced_language, det = detect_language_for_segment(
@@ -572,13 +637,58 @@ if uploaded_file:
                                 "LID con confianza baja (%s); heredado/anterior='%s'.",
                                 det.confidence, forced_language,
                             )
-                    idioma_anterior_lid = forced_language
+                    idioma_objetivo = forced_language.lower()  # "es" | iso_lb
+                    # Fin del tramo ANTERIOR (antes de sobrescribirlo al final del
+                    # bucle): se usa para la doble confirmación dentro del turno.
+                    fin_segmento_previo_s = fin_segmento_anterior_s
+                    # 'idioma_anterior_lid' se actualiza al FINAL del bucle con el
+                    # idioma decidido (híbrido) para la inercia temporal del LID.
                     fin_segmento_anterior_s = segments_vad[i].end if segments_vad else None
                     
-                    dat = transcribir_segmento_forense(client, seg, nombre_lb, iso_lb, historial_contexto, idioma_actual, forced_language=forced_language)
+                    # ------------ PASO B: transcripción guiada / filtro RMS estricto -----------
+                    energia_insuficiente = (
+                        voz_principal_db is not None
+                        and energias_tramos
+                        and energias_tramos[i] < voz_principal_db - ENERGY_STRICT_MARGIN_DB
+                    )
+                    if energia_insuficiente:
+                        logger.debug(
+                            "Tramo [%s] descartado por energía baja (%.1f dBFS < %.1f dBFS).",
+                            formatear_tiempo(start), energias_tramos[i],
+                            voz_principal_db - ENERGY_STRICT_MARGIN_DB,
+                        )
+                        texto_segmento = ""
+                        dat = {"idioma": idioma_objetivo.upper(), "texto": ""}
+                    else:
+                        dat = transcribir_segmento_forense(
+                        client, seg, nombre_lb, iso_lb, historial_contexto,
+                        idioma_actual, idioma_objetivo=idioma_objetivo,
+                    )
                     
                     texto_segmento = dat.get('texto','')
-                    idioma_detectado = dat.get('idioma','??')
+                    # Decisión final con DOBLE CONFIRMACIÓN (agnóstica): el NLP de
+                    # texto restringido a [ES, Lengua B]; dentro de un turno activo
+                    # de Lengua B, salir a español exige confirmación textual.
+                    texto_lengua = detect_text_language(texto_segmento, "es", iso_lb)
+                    en_turno_lengua_b = (
+                        fin_segmento_previo_s is not None
+                        and idioma_anterior_lid == iso_lb.lower()
+                        and segments_vad
+                        and (segments_vad[i].start - fin_segmento_previo_s) < T_INERTIA_S
+                    )
+                    if en_turno_lengua_b and idioma_objetivo == "es":
+                        # Salir de la Lengua B a mitad de turno exige DOBLE
+                        # CONFIRMACIÓN: el texto NLP debe confirmar 'es'. Si el
+                        # texto duda (None) o es Lengua B, se MANTIENE la Lengua B
+                        # como idioma (no se fuerza la transcripción a español).
+                        if texto_lengua == "es":
+                            idioma_detectado = "ES"
+                        else:
+                            idioma_detectado = iso_lb.upper()
+                    elif texto_lengua == iso_lb.lower():
+                        idioma_detectado = iso_lb.upper()
+                    else:
+                        idioma_detectado = forced_language.upper()
                     
                     # Actualizar contexto (si hay texto válido)
                     if texto_segmento:
@@ -586,10 +696,13 @@ if uploaded_file:
                         if len(historial_contexto) > 800: # Limite para no saturar
                             historial_contexto = historial_contexto[-800:]
                     
-                    # Mantener registro del último idioma detectado como contexto de continuidad
-                    # (el prompt decide el idioma real del fragmento actual sin sesgo de inercia).
-                    if idioma_detectado in ["ES", iso_lb]:
-                        idioma_actual = idioma_detectado
+                    # Romper el bucle de retroalimentación: idioma_actual se
+                    # actualiza SIEMPRE con la decisión híbrida (audio LID +
+                    # léxico de texto), no con la respuesta del LLM.
+                    idioma_actual = idioma_detectado
+                    # La inercia temporal del siguiente tramo usa el idioma ya
+                    # corregido (híbrido), no el JSON del LLM.
+                    idioma_anterior_lid = idioma_detectado.lower()
                     
                     bloque = f"[{formatear_tiempo(start)}] [{idioma_detectado}]\n{texto_segmento}\n\n"
                     out_buf.write(bloque)

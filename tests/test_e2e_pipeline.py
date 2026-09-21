@@ -4,13 +4,14 @@
 Simula el flujo completo que ejecuta app.py sobre un archivo de prueba:
   * Fase 1: ``preprocess_audio_base`` (PCM 16 kHz / mono / 16-bit, -18 LUFS)
   * Fase 2: ``detect_speech_segments`` + ``export_speech_chunks`` (pad 400 ms)
-  * Fase 4: ``detect_language_for_segment`` (idioma forzado por tramo)
+  * Fase 4: ``detect_language_for_segment`` + ``detect_text_language`` (híbrido)
   * Fase 3: transcripción tramo a tramo USANDO una ASR local real como
-    stand-in del LLM remoto, forzando ``language=<forced_language>``.
+    stand-in del LLM remoto, SIN idioma forzado (``language=None``: la ASR
+    transcribe literalmente en el idioma original, evitando traducción).
 
 Se valida la **consistencia global**: todos los timestamps quedan dentro del
-audio original, los chunks exportados llevan los mismos ms en el nombre, y
-cada tramo transcrito usa el idioma detectado por el LID.
+audio original, los chunks exportados llevan los mismos ms en el nombre, y la
+etiqueta de cada tramo refleja el idioma detectado (LID/híbrido).
 """
 
 import os
@@ -114,7 +115,8 @@ def test_e2e_pipeline_completo(tmp_path):
         assert detection.confidence > 0.5
 
     # ------------------------------------------------------------- Fase 3
-    # Stand-in del LLM: ASR local real que consume language=forced_language
+    # Stand-in del LLM: ASR local real. SIN language forzado (language=None)
+    # para que transciba literalmente en el idioma original de cada tramo.
     model = lid.get_lid_model()
     acta_lines = []
     transcritos_con_texto = 0
@@ -123,8 +125,13 @@ def test_e2e_pipeline_completo(tmp_path):
         end_sample = int(round(seg.end * 16_000))
         chunk = lid_audio[start_sample:end_sample]
 
-        result, _info = model.transcribe(
-            chunk, language=language, beam_size=1, vad_filter=False
+        initial_prompt = (
+            f"Transcripción bilingüe en castellano y {language.upper()} ({language}). "
+            "Transcribir literalmente las palabras pronunciadas sin traducir ni normalizar."
+        )
+        result, _info = model.transcribe(  # language=None -> autodetección literal
+            chunk, language=None, beam_size=1, vad_filter=False,
+            initial_prompt=initial_prompt,
         )
         texto = " ".join(s.text for s in result).strip()
         if texto:

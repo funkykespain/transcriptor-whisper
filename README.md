@@ -2,7 +2,7 @@
 <img src="profile.png" alt="Transcriptor Profile" width="150"/>
 </p>
 
-# 🎓 Transcriptor de Exámenes (v2.1.2)
+# 🎓 Transcriptor de Exámenes (v2.2)
 ## Asignatura: Interpretación Bilateral
 
 [![Release](https://img.shields.io/github/v/release/funkykespain/transcriptor-whisper?style=flat-square)](https://github.com/funkykespain/transcriptor-whisper/releases)
@@ -44,6 +44,19 @@ Al finalizar, aparecerá el entorno de corrección:
 *En la barra lateral, puedes desplegar los "Ajustes manuales" si necesitas afinar la sensibilidad para audios muy bajos o ruidosos. Una vez reajustado manualmente, vuelve a pulsar el botón "GENERAR ACTA DE EXAMEN" para que los cambios surtan efecto.*
 
 ![Resultado Final](screenshot4.png)
+
+---
+
+## 🚀 Novedades de la Versión 2.2
+
+> **v2.2**: Motor de idioma **100 % agnóstico** (sin diccionarios ni reglas por idioma): LID por segmento con **inercia conversacional e histéresis**, **pipeline en 2 fases** (LID primero → Transcripción Guiada) y **filtros anti-bleed**. Funciona para Español + cualquier Lengua B (italiano, inglés, francés, alemán…).
+
+* 🧭 **Pipeline en 2 Fases (LID primero → Transcripción Guiada):** para cada segmento se resuelve **antes** de transcribir el idioma objetivo (`LID de audio + Inercia + Histéresis`); ese idioma se inyecta como **directiva obligatoria** en la llamada ASR/LLM (Fase 2) para transcribir con la ortografía/gramática de la Lengua B o en español literal.
+* ⏱️ **Inercia Conversacional e Histéresis (ventana 6.0 s):** si el silencio entre fragmentos contiguos es `Δt < 6.0 s` se consideran el **mismo turno**: la Lengua B activa se premia/hereda (cubre pausas de pensamiento/respiración de 3-6 s). Los silencios largos (≥ 6.0 s) delimitan turnos nuevos y permiten el cambio real de idioma.
+* 🛡️ **Doble Confirmación para Cambiar de Idioma:** dentro de un turno activo de Lengua B, salir a Español exige **confianza acústica ≥ 0.95** **y** que el **NLP del texto confirme `es`**; si la acústica o el texto presentan interlengua/ambigüedad, se **mantiene la Lengua B** y la Fase 2 transcribe con su ortografía.
+* 🚫 **Filtro de Sangrado de Audio / Auriculares:** filtrado **por energía RMS pre-LLM** (fragmentos muy por debajo de la voz principal se descartan sin llamada) + **directiva estricta en el prompt** (murmullos distantes, auriculares o sangrado de fondo → texto vacío obligatorio, prohibido transcribir voz secundaria).
+* 🖥️ **Soporte ARM64 (Ampere A1 / Easypanel/VPS aarch64):** imagen `python:3.12-slim` — todas las dependencias compiladas (`onnxruntime`, `ctranslate2`, `av`, `lingua-language-detector`, `numpy`) tienen wheel aarch64 para CPython 3.12; VAD en **ONNX puro sin PyTorch**; LID con `faster-whisper tiny` en INT8.
+* 🎚️ **Nuevas variables configurables** (ver tabla de configuración): `ASR_INERTIA_WINDOW_S` (6.0), `ASR_LID_INERTIA_BIAS` (0.15), `ASR_LID_HYSTERESIS_DELTA` (0.15), `ASR_LID_EXIT_CONFIDENCE` (0.95), `ASR_ENERGY_STRICT_MARGIN_DB` (18), `ASR_TEXT_LID_BACKEND` (`lingua`→`langdetect`), `ASR_ALLOWED_LANGUAGES`, `ASR_LID_CONFIDENCE_THRESHOLD` (0.5), `ASR_DEFAULT_LANGUAGE` (`es`).
 
 ---
 
@@ -103,7 +116,7 @@ Ideal para desplegar en VPS (DigitalOcean, Hetzner, AWS) con recursos mínimos (
 ### 1. Construir la imagen
 
 ```bash
-docker build -t transcriptor-bilateral:v2.1.2 .
+docker build -t transcriptor-bilateral:v2.2 .
 
 ```
 
@@ -114,7 +127,7 @@ docker run -d -p 8501:8501 \
   --env-file .env \
   --name transcriptor-app \
   --restart unless-stopped \
-  transcriptor-bilateral:v2.1.2
+  transcriptor-bilateral:v2.2
 
 ```
 
@@ -158,28 +171,46 @@ pip install -r requirements.txt
 > fugas de bajo nivel sin tocar la voz (medido: −9.5 dB en contenido bajo −32 dBFS,
 > 0 dB en voz). Configurable en `audio_preprocessing.DEFAULT_GATE_*`.
 >
-> 🌐 **LID con contexto:** para tramos < 1.5 s o de baja confianza, `audio_lid.py`
-> amplía la ventana ±1 s con el audio circundante; si sigue sin superar el umbral,
-> **hereda el idioma del segmento anterior** (en lugar del fallback rígido).
-> Configurable con `MIN_CONTEXT_DURATION_S` / `CONTEXT_EXTRA_SECONDS`.
+> 🌐 **LID con contexto e híbrido Audio+Texto (100 % agnóstico, sin léxico):** los
+> micro-chunks < 1.5 s **no se analizan** con Whisper; heredan el idioma del segmento
+> anterior (`MIN_LID_DURATION_S`). El texto transcrito se clasifica con NLP
+> (`lingua-language-detector` por defecto, fallback `langdetect`) restringido SIEMPRE a
+> los dos idiomas de la sesión `[ES, Lengua B]`; si el texto es Lengua B con suficiente
+> confianza, la etiqueta final pasa a la Lengua B (code-switching). Sin listas de
+> palabras harcodeadas. Backend seleccionable con `ASR_TEXT_LID_BACKEND=lingua|langdetect`.
 
-### 🌐 Detección de idioma por segmento (Fase 4 - LID)
+### 🌐 Detección de idioma por segmento (Fase 4 - LID) y Pipeline en 2 Fases
 
-Antes de transcribir cada fragmento se detecta su idioma con el **selector de
-idioma nativo de Whisper** (`faster-whisper`, modelo `tiny` en CPU, ≈75 MB) y
-ese idioma se fuerza en la llamada ASR (inyectado en el prompt forense; con
-una ASR local se pasaría como `language=...`). Si la confianza no supera el
-umbral, se usa el idioma por defecto (comportamiento seguro):
+Para cada fragmento se ejecuta un **pipeline en 2 fases, 100 % agnóstico**:
+
+1. **Paso A – LID primero:** se detecta el idioma del audio con el **selector nativo
+   de Whisper** (`faster-whisper tiny`, CPU/INT8) sobre el segmento, con **inercia
+   conversacional** (Δt < 6 s), **histéresis** y **doble confirmación** (acústica
+   ≥ 0.95 + NLP de texto) para no perder la Lengua B en turnos activos. Los
+   micro-chunks < 1.5 s no se analizan y heredan el idioma anterior.
+2. **Paso B – Transcripción Guiada:** el `idioma_objetivo` resuelto se pasa como
+   directiva obligatoria a la llamada ASR/LLM para transcribir con la ortografía
+   y gramática de la Lengua B (o en español literal), evitando que una
+   pronunciación no nativa se fuerce a castellano.
+
+El texto transcrito se clasifica además con **NLP** (`lingua-language-detector` por
+defecto, fallback `langdetect`) restringido SIEMPRE a `[ES, Lengua B]` para la
+etiqueta final y para la confirmación de cambio de idioma. Sin listas de palabras
+harcodeadas.
 
 | Variable | Efecto |
 | :--- | :--- |
 | `ASR_LID_MODEL` | Tamaño del modelo Whisper para LID (`tiny` por defecto; opciones: `base`, `small`, o una ruta con el modelo precargado). |
 | `ASR_LID_MODEL_DIR` | Carpeta del modelo ya descargado (opcional, evita descarga en runtime). |
+| `ASR_TEXT_LID_BACKEND` | Backend NLP del clasificador de texto (`lingua` por defecto → fallback `langdetect`; se puede forzar con `lingua` o `langdetect`). |
 | `ASR_LID_CONFIDENCE_THRESHOLD` | Umbral de confianza del LID (por defecto `0.5`). Por debajo → fallback. |
 | `ASR_DEFAULT_LANGUAGE` | Idioma por defecto/fallback (por defecto `es`). |
 | `ASR_ALLOWED_LANGUAGES` | Idiomas candidatos del LID (ISO-639-1, separados por coma; p. ej. `es,it,en`). Si está definido, el LID elige el idioma con mayor score **dentro de ese subconjunto** (filtra falsos positivos de idiomas raros/secundarios). Vacío/ausente = evaluación completa sobre todos los idiomas soportados. |
-| `ASR_LID_T_INERTIA` | Ventana de inercia temporal `T_inertia` (s, por defecto `2.0`): si el intervalo de silencio entre segmentos consecutivos (`Δt`) es menor, se premia al idioma del segmento anterior. |
+| `ASR_INERTIA_WINDOW_S` | Ventana de inercia conversacional `T_inertia` (s, por defecto `6.0`; legado: `ASR_LID_T_INERTIA`): si el silencio entre fragmentos contiguos (`Δt`) es menor, se consideran el MISMO turno y se premia/hereda el idioma precedente (cubre pausas de pensamiento/respiración de 3-6 s). |
 | `ASR_LID_INERTIA_BIAS` | Bonificación suave sumada a la probabilidad del idioma anterior dentro de esa ventana (por defecto `0.15`); con `Δt ≥ T_inertia` la inercia se anula y la evaluación es neutra. |
+| `ASR_LID_HYSTERESIS_DELTA` | **Histéresis de turno**: dentro de la ventana, cambiar de idioma (p. ej. Lengua B → español a mitad de turno) exige `score >= threshold + delta` (por defecto `0.15` → umbral efectivo 0.65). Sin evidencia abrumadora se mantiene el idioma activo; fuera de la ventana se usa el umbral normal. |
+| `ASR_LID_EXIT_CONFIDENCE` | **Doble confirmación acústica** para salir de la Lengua B dentro de un turno activo: el cambio exige `score >= max(threshold + delta, exit)` (por defecto `0.95`). El texto además debe confirmarlo (la etiqueta no pasa a `es` si el texto duda o es Lengua B). |
+| `ASR_ENERGY_STRICT_MARGIN_DB` | Filtro RMS estricto pre-LLM: distancia mínima (dB, por defecto `18`) por debajo de la voz principal (mediana del RMS de los tramos) para **descartar** un fragmento (sangrado/auriculares) sin enviarlo al LLM. |
 
 ---
 

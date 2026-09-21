@@ -1,21 +1,35 @@
-Byte-compiled / optimized / DLL files
-
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
-Virtual environments
-
+# Virtual environments
 venv/
+.venv/
+
+# Cache de tests / cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Audio de prueba local (entradas/salidas del pipeline, chunks, logs)
+*.aac
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.log
+chunks_vad_*/
+*.part
+
+# Configuración personal / secretos
 .env
-
-Streamlit config
-
 .streamlit/secrets.toml
 
-OS Files
-
+# OS Files
 .DS_Store
 
+# Editores
 .vscode/
 *.code-workspace
