@@ -63,7 +63,7 @@ from audio_vad import (  # noqa: E402
 )
 
 ARCHIVO_POR_DEFECTO = ("/home/kyke/Descargas/Transcript/Bilateral/"
-                       "bilateral italiano elena garcia claro (1).aac")
+                       "Audio_de_ejemplo.m4a")
 SEGUNDO_POR_DEFECTO = 574
 AMPLITUD = 2          # segmentos de contexto a cada lado del objetivo
 MIN_SILENCE_MS = 2000  # valor por defecto de la sesión en app.py
