@@ -3,7 +3,7 @@
 
 Uso (desde la raíz del repo):
     venv/bin/python scripts/diagnostico_segmento.py \
-        --archivo "/home/kyke/Descargas/Transcript/Bilateral/bilateral italiano elena garcia claro (1).aac" \
+        --archivo "/home/kyke/Descargas/Transcript/Bilateral/Audio_de_ejemplo.m4a" \
         --segundo 574 [--iso-b auto|it] [--asr local|remoto|ambos] [--contexto asr|exacto]
 
 Reproduce los pasos EXACTOS de app.py (importando las funciones de producción bajo
