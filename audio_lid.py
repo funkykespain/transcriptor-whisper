@@ -16,8 +16,10 @@ Flujo:
      score del idioma detectado es inferior al umbral (o la detección falla),
      hace fallback al idioma por defecto configurado (``ASR_DEFAULT_LANGUAGE``,
      por defecto ``es``) para un comportamiento seguro.
-  3. La app fuerza ``language=<idioma>`` al motor ASR por segmento evitando
-     alucinaciones o traducciones no deseadas.
+  3. **La ASR transcribe SIN idioma forzado** (la transcripción es literal en
+     el idioma original hablado, evitando traducciones inducidas por Whisper).
+     El idioma final del fragmento lo decide la **decisión híbrida audio+texto**
+     con :func:`detect_text_language` (Español vs Lengua B de la sesión).
 
 Configuración (variables de entorno):
   * ``ASR_LID_MODEL``             : tamaño del modelo Whisper para LID
@@ -52,19 +54,35 @@ LID_MODEL_DIR: Optional[str] = os.getenv("ASR_LID_MODEL_DIR") or None
 #: Ventana de análisis de Whisper (el LID usa los primeros segundos del chunk).
 LID_FIRST_SECONDS: float = 30.0
 
-#: Duración mínima (s) a partir de la cual el LID se hace solo con el tramo;
-#: por debajo se amplía la ventana de análisis con el audio circundante.
-MIN_CONTEXT_DURATION_S: float = 1.5
-#: Segundos de audio circundante (a cada lado) que se añaden al tramo corto.
+#: Duración mínima (s) para ejecutar el LID de Whisper: los fragmentos MÁS
+#: cortos no tienen contexto acústico suficiente y **no se analizan**; heredan
+#: el idioma del segmento anterior evitando caídas al idioma por defecto.
+MIN_LID_DURATION_S: float = 1.5
+#: Segundos de audio circundante (a cada lado) para ampliar el análisis de
+#: un tramo de baja confianza (que ya tiene duración suficiente).
 CONTEXT_EXTRA_SECONDS: float = 1.0
 
 # --- Matriz de transición temporal (inercia de idioma según el silencio) -------
-#: Ventana de inercia ``T_inertia`` (s): si el intervalo de silencio entre el
-#: segmento anterior y el actual es menor, se premia al idioma precedente.
-T_INERTIA_S: float = float(os.getenv("ASR_LID_T_INERTIA", "2.0"))
+#: Ventana de inercia conversacional ``T_inertia`` (s): si el intervalo de
+#: silencio entre fragmentos contiguos es menor (por defecto 6.0 s: pausas de
+#: pensamiento/respiración en turnos naturales de 3-6 s), se considera el MISMO
+#: turno y se premia/hereda el idioma precedente. Configurable con la env
+#: ``ASR_INERTIA_WINDOW_S`` (legado: ``ASR_LID_T_INERTIA``).
+T_INERTIA_S: float = float(os.getenv("ASR_INERTIA_WINDOW_S",
+                                     os.getenv("ASR_LID_T_INERTIA", "6.0")))
 #: Bonificación suave (inertia bias) sumada a la probabilidad del idioma del
 #: segmento anterior antes de seleccionar el máximo dentro de allowed_languages.
 INERTIA_BIAS: float = float(os.getenv("ASR_LID_INERTIA_BIAS", "0.15"))
+#: Histéresis de turno (delta sobre el umbral): para CAMBIAR de idioma en medio
+#: de un turno activo (Δt < T_inertia) se exige evidencia abrumadora
+#: (``score >= threshold + delta``). Configurable con ``ASR_LID_HYSTERESIS_DELTA``.
+HYSTERESIS_DELTA: float = float(os.getenv("ASR_LID_HYSTERESIS_DELTA", "0.15"))
+#: Confianza de SALIDA (doble confirmación acústica): dentro de un turno activo
+#: cambiar de idioma respecto al precedente exige
+#: ``score >= max(threshold + HYSTERESIS_DELTA, EXIT_CONFIDENCE)`` (por defecto
+#: 0.95). Evita salir de la Lengua B con pronunciación castellanizada.
+#: Configurable con ``ASR_LID_EXIT_CONFIDENCE``.
+EXIT_CONFIDENCE: float = float(os.getenv("ASR_LID_EXIT_CONFIDENCE", "0.95"))
 
 #: Variable de entorno con la lista de idiomas candidatos (ISO-639-1, comas).
 _ENV_ALLOWED_LANGUAGES: str = "ASR_ALLOWED_LANGUAGES"
@@ -233,22 +251,35 @@ def detect_language_for_segment(
     previous_language: Optional[str] = None,
     previous_end: Optional[float] = None,
     allowed_languages: Optional[Sequence[str]] = None,
+    t_inertia: Optional[float] = None,
+    hysteresis_delta: Optional[float] = None,
 ) -> Tuple[str, LanguageDetection]:
     """Detecta el idioma de un tramo con suavizado contextual e inercia temporal.
 
     Estrategia (fragmentos cortos o de baja confianza LID):
-      * Si el tramo dura menos de ``MIN_CONTEXT_DURATION_S`` (1.5 s) o el
-        score (restringido a ``allowed_languages`` si está definido) no supera
-        ``threshold``, se **amplía la ventana de análisis** con
-        ``context_window_s`` segundos (±1 s) del audio circundante.
+      * Si el tramo dura menos de ``MIN_LID_DURATION_S`` (1.5 s), **NO se
+        ejecuta** Whisper LID (no hay contexto acústico suficiente): se hereda
+        el idioma del segmento anterior (``previous_language``) o, si no hay,
+        ``default``. Evita caídas al idioma por defecto en micro-chunks VAD.
+      * Si el tramo tiene duración suficiente pero el score (restringido a
+        ``allowed_languages`` si está definido) no supera ``threshold``, se
+        **amplía la ventana de análisis** con ``context_window_s`` segundos
+        (±1 s) del audio circundante.
       * **Inercia temporal:** si ``previous_end`` es conocido, se calcula el
         intervalo de silencio ``Δt = segment.start − previous_end``. Con
-        ``Δt < T_INERTIA_S`` se suma ``INERTIA_BIAS`` a la probabilidad del
-        idioma anterior (``previous_language``) antes de elegir el máximo
-        dentro de ``allowed_languages``; con ``Δt ≥ T_INERTIA_S`` la inercia
-        se anula y la evaluación es neutra.
+        ``Δt < t_inertia`` (por defecto ``T_INERTIA_S`` = 6.0 s) se suma
+        ``INERTIA_BIAS`` a la probabilidad del idioma anterior
+        (``previous_language``) antes de elegir el máximo dentro de
+        ``allowed_languages``; con ``Δt ≥ t_inertia`` la inercia se anula y la
+        evaluación es neutra.
+      * **Histéresis de turno:** dentro de la ventana (``Δt < t_inertia``), si el
+        idioma precedente está activo y el candidato propone CAMBIAR de idioma
+        (p. ej. Lengua B → español a mitad de turno), se exige evidencia
+        **abrumadora**: ``score >= threshold + hysteresis_delta``
+        (por defecto 0.65 con threshold 0.5). Si no se alcanza, se MANTIENE la
+        inercia del idioma activo en lugar de caer al idioma por defecto.
       * Si la confianza sigue por debajo del umbral, se **hereda el idioma del
-        segmento anterior** si y solo si ``Δt < T_INERTIA_S`` (en silencios
+        segmento anterior** si y solo si ``Δt < t_inertia`` (en silencios
         largos se cae al idioma por defecto, sin inercia).
 
     Cuando ``allowed_languages`` no es None, se solicita al detector el mapa
@@ -257,25 +288,30 @@ def detect_language_for_segment(
 
     Returns:
         ``(idioma, detección)``: el idioma resuelto (ISO) y la última
-        :class:`LanguageDetection` (para registrar su confianza).
+        :class:`LanguageDetection` (para registrar su confianza). En
+        micro-chunks sin análisis, la detección devuelve confianza 0.0.
     """
     start_sample = min(len(audio_array), int(round(segment.start * sampling_rate)))
     end_sample = min(len(audio_array), int(round(segment.end * sampling_rate)))
     end_sample = max(start_sample, end_sample)
     delta_t = segment.start - previous_end if previous_end is not None else None
+    window = t_inertia if t_inertia is not None else T_INERTIA_S
+    hdelta = hysteresis_delta if hysteresis_delta is not None else HYSTERESIS_DELTA
+
+    # Micro-chunk: sin contexto acústico suficiente -> heredar, sin ejecutar LID.
+    if segment.duration < MIN_LID_DURATION_S:
+        inherited = normalize_iso(previous_language) if previous_language else normalize_iso(default)
+        return inherited, LanguageDetection(language=inherited, confidence=0.0)
 
     top_n = 99 if allowed_languages else 5
     detection = detect_language(
         audio_array[start_sample:end_sample], model=model,
         sampling_rate=sampling_rate, top_n=top_n,
     )
-    detection = _bias_by_time_inertia(detection, previous_language, delta_t)
-    _, score = _restricted_best(detection, allowed_languages)
-    needs_context = (
-        segment.duration < MIN_CONTEXT_DURATION_S
-        or score < threshold
-    )
-    if needs_context and context_window_s > 0:
+    detection = _bias_by_time_inertia(detection, previous_language, delta_t,
+                                      t_inertia=window)
+    candidate, score = _restricted_best(detection, allowed_languages)
+    if score < threshold and context_window_s > 0:
         context_samples = int(round(context_window_s * sampling_rate))
         context_start = max(0, start_sample - context_samples)
         context_end = min(len(audio_array), end_sample + context_samples)
@@ -283,37 +319,160 @@ def detect_language_for_segment(
             audio_array[context_start:context_end],
             model=model, sampling_rate=sampling_rate, top_n=top_n,
         )
-        detection = _bias_by_time_inertia(detection, previous_language, delta_t)
+        detection = _bias_by_time_inertia(detection, previous_language, delta_t,
+                                          t_inertia=window)
+        candidate, score = _restricted_best(detection, allowed_languages)
 
-    language, ok = resolve_language(
-        detection, threshold=threshold, default=default,
-        allowed_languages=allowed_languages,
-    )
-    if ok:
-        return normalize_iso(language), detection
-    iner_cadena_activa = previous_language is not None and delta_t is not None and delta_t < T_INERTIA_S
-    if iner_cadena_activa:
-        return normalize_iso(previous_language), detection
+    # --- Decisión con HISTÉRESIS DE TURNO (agnóstica a idiomas) -------------
+    en_ventana = _en_ventana(previous_language, delta_t, window)
+    prev = normalize_iso(previous_language) if previous_language else None
+    if candidate is not None and score >= threshold:
+        # Doble confirmación acústica de salida del idioma activo en el turno.
+        umbral_cambio = max(threshold + hdelta, EXIT_CONFIDENCE)
+        # Dentro de un turno activo, cambiar de idioma exige evidencia abrumadora.
+        if en_ventana and allowed_languages and prev is not None and normalize_iso(candidate) != prev:
+            if score < umbral_cambio:
+                return normalize_iso(prev), detection
+            return normalize_iso(candidate), detection
+        return normalize_iso(candidate), detection
+    if en_ventana and prev:
+        # Herencia: se mantiene la inercia del idioma activo del turno.
+        return normalize_iso(prev), detection
     return normalize_iso(default), detection
+
+
+# ---------------------------------------------------------------------------
+# Clasificación de texto agnóstica (solo ES + Lengua B, sin léxico harcodeado)
+# ---------------------------------------------------------------------------
+#: Backend NLP del clasificador de texto: ``lingua-language-detector``
+#: (recomendado) con fallback a ``langdetect`` (100 % Python, útil en ARM sin
+#: wheel de lingua). Se configura con la env ``ASR_TEXT_LID_BACKEND``.
+_ENV_TEXT_LID_BACKEND: str = "ASR_TEXT_LID_BACKEND"
+_text_lid_detectors: Dict[tuple, object] = {}
+
+
+def _build_lingua_detector(languages: Sequence[str]):
+    """Detector lingua restringido a los idiomas dados (códigos ISO dinámicos)."""
+    from lingua import IsoCode639_1, LanguageDetectorBuilder
+
+    enums = [getattr(IsoCode639_1, normalize_iso(code).upper()) for code in languages if code]
+    detector = LanguageDetectorBuilder.from_iso_codes_639_1(*enums).build()
+
+    def detect_text(texto: str):
+        language = detector.detect_language_of(texto)
+        if language is None:
+            return None
+        confidence = float(detector.compute_language_confidence(texto, language))
+        return normalize_iso(language.iso_code_639_1.name), confidence
+
+    return detect_text
+
+
+def _build_langdetect_detector(languages: Sequence[str]):
+    """Detector langdetect restringido a los idiomas dados (fallback puro Python)."""
+    from langdetect import DetectorFactory, detect_langs
+
+    DetectorFactory.seed = 0  # determinista
+    allowed = {normalize_iso(code) for code in languages if code}
+
+    def detect_text(texto: str):
+        try:
+            hits = detect_langs(texto)
+        except Exception:  # noqa: BLE001 - texto demasiado corto/ilegible
+            return None
+        for item in hits:
+            code = normalize_iso(item.lang)
+            if code in allowed:
+                return code, float(item.prob)
+        return None
+
+    return detect_text
+
+
+def _text_detector_for(languages: Sequence[str]):
+    """Devuelve la función texto->(código_iso, confianza) para los idiomas dados."""
+    def _build():
+        preference = os.getenv(_ENV_TEXT_LID_BACKEND, "auto").strip().lower()
+        order = ("lingua", "langdetect") if preference == "auto" else ((preference,) if preference in ("lingua", "langdetect") else ())
+        for backend in order:
+            try:
+                if backend == "lingua":
+                    return _build_lingua_detector(languages)
+                if backend == "langdetect":
+                    return _build_langdetect_detector(languages)
+            except Exception:  # noqa: BLE001 - backend no disponible: probar el siguiente
+                continue
+        return None
+
+    key = tuple(sorted(normalize_iso(code) for code in languages if code))
+    if key not in _text_lid_detectors:
+        _text_lid_detectors[key] = _build()
+    return _text_lid_detectors[key]
+
+
+def detect_text_language(
+    texto: Optional[str],
+    iso_a: str = DEFAULT_LANGUAGE,
+    iso_b: str = "",
+    *,
+    min_confidence: float = CONFIDENCE_THRESHOLD,
+) -> Optional[str]:
+    """Clasifica el idioma del texto ÚNICAMENTE entre ``iso_a`` e ``iso_b``.
+
+    Arquitectura **100 % agnóstica** (sin palabras harcodeadas en ningún
+    idioma): se usa un backend NLP (lingua-language-detector o langdetect)
+    restringido a los dos idiomas de la sesión, p. ej. ``['es', 'it']``.
+
+    Devuelve el código ISO detectado si la confianza supera ``min_confidence``;
+    ``None`` si no hay texto, no hay backend NLP disponible o la confianza es
+    baja (el llamador mantiene entonces el resultado del LID de audio).
+    """
+    codes = sorted({normalize_iso(code) for code in (iso_a, iso_b) if code})
+    if not texto or not texto.strip() or len(codes) < 2:
+        return None
+    detector = _text_detector_for(codes)
+    if detector is None:
+        return None
+    try:
+        result = detector(texto[:2000])
+    except Exception:  # noqa: BLE001 - el clasificador de texto nunca debe romper
+        return None
+    if not result:
+        return None
+    language, confidence = result
+    if language in codes and confidence >= min_confidence:
+        return language
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Umbral / fallback / restricción de idiomas
 # ---------------------------------------------------------------------------
+def _en_ventana(previous_language: Optional[str], delta_t: Optional[float],
+                t_inertia: float) -> bool:
+    """True si hay idioma previo y el silencio Δt cae dentro de la ventana."""
+    return (previous_language is not None and delta_t is not None
+            and delta_t < t_inertia)
+
+
 def _bias_by_time_inertia(
     detection: LanguageDetection,
     previous_language: Optional[str],
     delta_t: Optional[float],
+    *,
+    t_inertia: Optional[float] = None,
 ) -> LanguageDetection:
     """Aplica el sesgo de inercia temporal a las probabilidades del detector.
 
     Si ``delta_t`` (intervalo de silencio desde el segmento anterior) es
-    conocido y menor que ``T_INERTIA_S``, suma ``INERTIA_BIAS`` a la
-    probabilidad del idioma del segmento anterior antes de elegir el máximo
-    dentro de ``allowed_languages``. Si ``delta_t >= T_INERTIA_S`` (silencio
-    largo), devuelve las probabilidades sin tocar (inercia anulada).
+    conocido y menor que ``t_inertia`` (por defecto ``T_INERTIA_S``), suma
+    ``INERTIA_BIAS`` a la probabilidad del idioma del segmento anterior antes
+    de elegir el máximo dentro de ``allowed_languages``. Si
+    ``delta_t >= t_inertia`` (silencio largo), devuelve las probabilidades sin
+    tocar (inercia anulada).
     """
-    if previous_language is None or delta_t is None or delta_t >= T_INERTIA_S:
+    window = t_inertia if t_inertia is not None else T_INERTIA_S
+    if previous_language is None or delta_t is None or delta_t >= window:
         return detection
     if not detection.probabilities:
         return detection

@@ -8,6 +8,7 @@ detección real con Whisper sobre muestras multilingües (OJO: requiere red la
 primera vez y se omiten si el modelo no está disponible).
 """
 
+import importlib.util
 import os
 import urllib.request
 import wave
@@ -116,7 +117,7 @@ def test_detect_language_probar_es_vs_it_con_detector_simulado(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2) Corte por segmento y formato
+# 2) Corte por segmento, formato y duración mínima de LID
 # ---------------------------------------------------------------------------
 def test_detect_language_for_segment_corta_y_aplica_umbral(monkeypatch):
     captured = {}
@@ -126,30 +127,54 @@ def test_detect_language_for_segment_corta_y_aplica_umbral(monkeypatch):
         return LanguageDetection(language="it", confidence=0.9)
 
     monkeypatch.setattr(lid, "detect_language", fake_detect)
-    audio_array = np.zeros(16000 * 3, dtype=np.float32)
+    audio_array = np.zeros(16000 * 4, dtype=np.float32)
     lang, det = lid.detect_language_for_segment(
-        audio_array, SpeechSegment(0.5, 1.5), default="es", context_window_s=0.0
+        audio_array, SpeechSegment(0.5, 2.5), default="es", context_window_s=0.0
     )
     assert lang == "it"
-    assert captured["len"] == 16000  # 1.0 s cortado del array completo
+    assert captured["len"] == 32000  # 2.0 s (>= MIN_LID_DURATION_S -> se analiza)
 
 
-def test_detect_language_for_segment_expande_ventana_contexto(monkeypatch):
-    """Tramo corto (<1.5 s): añade ±1 s de audio circundante a la detección."""
+def test_detect_language_for_segment_corto_no_ejecuta_lid_y_hereda(monkeypatch):
+    """Micro-chunk (<1.5 s): NO se ejecuta Whisper LID; hereda el idioma previo."""
+    llamadas = []
+
+    def boom(audio, **kwargs):  # si se llama, falla la prueba
+        llamadas.append(len(audio))
+        raise AssertionError("El LID no debe ejecutarse en micro-chunks")
+
+    monkeypatch.setattr(lid, "detect_language", boom)
+    audio_array = np.zeros(16000 * 5, dtype=np.float32)
+    lang, det = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(2.0, 3.0), default="es",
+        previous_language="it", previous_end=1.5,
+    )
+    assert llamadas == []             # sin inferencia de Whisper
+    assert lang == "it"               # hereda el idioma del segmento anterior
+    assert det.confidence == 0.0      # no hay detección real
+    # Sin idioma previo -> idioma por defecto
+    lang2, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(2.0, 3.0), default="es"
+    )
+    assert lang2 == "es"
+
+
+def test_detect_language_for_segment_expande_ventana_por_baja_confianza(monkeypatch):
+    """Tramo >= 1.5 s con score bajo: añade ±1 s de audio circundante."""
     captured = {}
 
     def fake_detect(audio, **kwargs):
         captured.setdefault("lens", []).append(len(audio))
-        return LanguageDetection(language="it", confidence=0.9)
+        return LanguageDetection(language="it", confidence=0.2)  # baja confianza
 
     monkeypatch.setattr(lid, "detect_language", fake_detect)
     audio_array = np.zeros(16000 * 10, dtype=np.float32)
     lang, _ = lid.detect_language_for_segment(
-        audio_array, SpeechSegment(1.0, 2.0), default="es"
+        audio_array, SpeechSegment(1.0, 3.0), default="es"
     )
-    assert lang == "it"
-    # 1ª llamada con el tramo (1.0 s); 2ª con ±1 s alrededor (3.0 s)
-    assert captured["lens"] == [16000, 48000]
+    assert lang == "es"               # 0.2 < umbral -> no confirma 'it'
+    # 1ª llamada con el tramo (2.0 s); 2ª con ±1 s alrededor (0.0-4.0 s)
+    assert captured["lens"] == [32000, 64000]
 
 
 def test_detect_language_for_segment_hereda_idioma_anterior(monkeypatch):
@@ -302,11 +327,12 @@ def test_inercia_decae_a_cero_si_dt_largo(monkeypatch):
 
     monkeypatch.setattr(lid, "detect_language", fake_detect)
     audio_array = np.zeros(16000 * 8, dtype=np.float32)
-    # segmento actual [3.0, 5.0]; anterior terminaba en 0.0 -> Δt = 3.0 s ≥ 2.0
+    # Ventana explícita de 2 s y Δt = 3.0 s → fuera de ventana → evaluación neutra
     lang, _ = lid.detect_language_for_segment(
         audio_array, SpeechSegment(3.0, 5.0), default="es",
         allowed_languages=["es", "it"], threshold=0.3,
         previous_language="it", previous_end=0.0, context_window_s=0.0,
+        t_inertia=2.0,
     )
     assert lang == "es"        # sin sesgo: 0.34 > 0.33
 
@@ -323,6 +349,150 @@ def test_bias_por_inercia_temporal_directo():
     assert neutro.probabilities == det.probabilities
     sin_previo = lid._bias_by_time_inertia(det, None, delta_t=0.5)
     assert sin_previo.probabilities == det.probabilities
+
+
+def test_ventana_inercia_6s_incluye_pausas_conversacionales(monkeypatch):
+    """Δt = 5.0 s (< 6.0 s por defecto) mantiene el turno y la Lengua B activa."""
+    probabilities = {"es": 0.30, "it": 0.20, "fr": 0.50}
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.50, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 12, dtype=np.float32)
+    lang, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(8.0, 10.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.5,
+        previous_language="it", previous_end=3.0, context_window_s=0.0,
+    )
+    # Δt = 5.0 < 6.0 → mismo turno: se hereda/mantiene 'it'
+    assert lang == "it"
+
+
+def test_histéresis_turno_mantiene_lengua_b_ante_evidencia_moderada(monkeypatch):
+    """Cambiar it→es a mitad de turno con score 0.50 no supera 0.65 -> sigue it."""
+    probabilities = {"es": 0.50, "it": 0.20, "fr": 0.30}
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.30, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 10, dtype=np.float32)
+    lang, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(4.0, 6.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.5,
+        previous_language="it", previous_end=0.0, context_window_s=0.0,
+    )
+    # Δt = 4.0 < 6.0, candidato 'es' 0.50 < 0.50+0.15 -> histéresis conserva 'it'
+    assert lang == "it"
+
+
+def test_histéresis_turno_cede_con_evidencia_abrumadora(monkeypatch):
+    """Cambio it→es a mitad de turno SOLO con doble confirmación acústica (≥0.95)."""
+    probabilities = {"es": 0.97, "it": 0.01, "fr": 0.02}
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.02, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 10, dtype=np.float32)
+    lang, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(4.0, 6.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.5,
+        previous_language="it", previous_end=0.0, context_window_s=0.0,
+    )
+    assert lang == "es"   # 0.97 >= max(0.5+0.15, 0.95)
+
+
+def test_histéresis_turno_0_94_no_autoriza_salir_de_lengua_b(monkeypatch):
+    """es @0.94 (pronunciación castellanizada) NO supera 0.95 -> se mantiene it."""
+    probabilities = {"es": 0.94, "it": 0.03, "fr": 0.03}
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.03, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 10, dtype=np.float32)
+    lang, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(4.0, 6.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.5,
+        previous_language="it", previous_end=0.0, context_window_s=0.0,
+    )
+    assert lang == "it"   # 0.94 < 0.95 -> doble confirmación acústica NO dada
+
+
+def test_histéresis_solo_fuera_de_ventana_cambia_con_umbral_normal(monkeypatch):
+    """Con Δt=7.0 s (> ventana 6.0 s) el español a 0.50 sí gana (turno nuevo)."""
+    probabilities = {"es": 0.50, "it": 0.20, "fr": 0.30}
+
+    def fake_detect(audio, **kwargs):
+        return LanguageDetection(
+            language="fr", confidence=0.30, probabilities=dict(probabilities)
+        )
+
+    monkeypatch.setattr(lid, "detect_language", fake_detect)
+    audio_array = np.zeros(16000 * 12, dtype=np.float32)
+    lang, _ = lid.detect_language_for_segment(
+        audio_array, SpeechSegment(8.0, 10.0), default="es",
+        allowed_languages=["es", "it"], threshold=0.5,
+        previous_language="it", previous_end=1.0, context_window_s=0.0,
+    )
+    # Δt = 7.0 >= 6.0 → turno nuevo: 'es' con umbral normal (0.50 >= 0.5)
+    assert lang == "es"
+
+
+# ---------------------------------------------------------------------------
+# 6) Clasificación de texto agnóstica (NLP: lingua -> langdetect)
+# ---------------------------------------------------------------------------
+NEEDS_LINGUA = pytest.mark.skipif(
+    importlib.util.find_spec("lingua") is None,
+    reason="Backend lingua-language-detector no instalado (code-switching requiere lingua)",
+)
+
+
+def test_detect_text_language_texto_claramente_lengua_b():
+    assert lid.detect_text_language(
+        "parliamo di questo progetto e delle sue potenzialità", "es", "it"
+    ) == "it"
+
+
+def test_detect_text_language_texto_claramente_es():
+    resultado = lid.detect_text_language(
+        "Hoy es un gran día y lo vamos a celebrar juntos mañana", "es", "it"
+    )
+    assert resultado in ("es", None)      # texto 100 % español nunca da 'it'
+    assert resultado != "it"
+
+
+@NEEDS_LINGUA
+def test_detect_text_language_code_switching_a_lengua_b():
+    """Code-switching 'Hoy es un grande onore...' -> la Lengua B gana al texto."""
+    assert lid.detect_text_language(
+        "Hoy es un grande onore para mí poder presentare questo progetto",
+        "es", "it",
+    ) == "it"
+
+
+def test_detect_text_language_sin_texto_o_backend_ausente(monkeypatch):
+    assert lid.detect_text_language("", "es", "it") is None
+    assert lid.detect_text_language(None, "es", "it") is None
+    assert lid.detect_text_language("   ", "es", "it") is None
+    # Sin backend NLP -> None (el llamador mantiene el resultado del audio)
+    monkeypatch.setattr(lid, "_text_detector_for", lambda *a, **k: None)
+    assert lid.detect_text_language("frase cualquiera en es y it", "es", "it") is None
+
+
+def test_detect_text_language_requiere_dos_idiomas_distintos():
+    assert lid.detect_text_language("frase", "es") is None        # falta Lengua B
+    assert lid.detect_text_language("frase", "es", "es") is None  # ambos iguales
 
 
 def test_detect_language_formato_no_normalizado_lanza(tmp_path):
