@@ -1,0 +1,24 @@
+# ---- Excluye del contexto de construcción Docker (no del repositorio Git) ----
+
+# Control de versiones y tooling
+.git
+.gitignore
+.dockerignore
+.pytest_cache
+**/__pycache__/
+*.py[cod]
+
+# Código que no entra en el contenedor de producción
+tests/
+scripts/
+
+# Documentación e imágenes (solo lectura humana)
+*.md
+*.png
+*.jpg
+*.jpeg
+
+# Configuración / secretos / entornos
+.env
+.venv
+venv/

@@ -249,14 +249,38 @@ La aplicación estará disponible en `http://localhost:8501`.
 
 ## 📋 Guía de Uso para Docentes
 
-1. **Login:** Introduce tu Clave Docente. Si no tienes, usa el botón de Ko-fi para solicitar una.
-2. **Subir Audio:** Arrastra el archivo del examen (MP3, M4A, AAC, WAV).
-3. **Calibración:** El sistema analizará la calidad del audio automáticamente.
-4. **Generar Acta:** Pulsa el botón. El sistema detectará los idiomas (ES + Idioma B) y transcribirá literalmente.
+### 🎙️ Consejos para una Grabación Óptima del Examen
+Para garantizar que la inteligencia artificial genere un acta literal 100 % fiel a lo que dice el alumno, sigue estos sencillos consejos durante la realización de la prueba:
+
+1. **📍 Posición del micrófono:**
+   * Coloca el dispositivo de grabación (grabadora, móvil o micrófono) **más cerca del alumno que del examinador**, ya que su producción oral es el objeto principal de evaluación.
+   * Evita colocar el micrófono justo debajo de folios, carpetas o apuntes que puedan moverse durante el examen.
+
+2. **🎧 Control de auriculares (si se utilizan audios de apoyo):**
+   * En pruebas de interpretación donde el alumno escucha un audio por auriculares, ajusta el volumen a un nivel cómodo pero **moderado**. Si el volumen está muy alto, el sonido del auricular se filtrará al micrófono de la sala ("sangrado de audio") y dificultará la transcripción limpia de la voz del alumno.
+
+3. **🗣️ Respeta los turnos de palabra (evita pisar la voz):**
+   * Procura no hablar por encima del alumno ni interrumpirlo mientras está formulando una frase. La IA separa mejor los idiomas y detecta las pausas cuando cada intervención se realiza por turno.
+   * Las pausas de pensamiento de hasta 5-6 segundos son gestionadas de forma natural por el sistema sin perder el hilo de la conversación.
+
+4. **🔇 Entorno acústico y ruidos distractores:**
+   * Realiza la prueba en una sala lo más silenciosa posible.
+   * Evita golpear la mesa con bolígrafos, teclear en ordenadores cerca del micrófono o mover sillas ruidosamente durante la intervención.
+
+5. **🔊 Proyección de la voz:**
+   * Pide al alumno que mantenga un volumen de voz constante, incluso cuando dude o piense la respuesta. Evita que murmure o baje bruscamente el tono al final de las oraciones.
+
+---
+
+### 🚀 Pasos para Procesar el Examen
+1. **Login:** Introduce tu Clave Docente en el menú lateral.
+2. **Subir Audio:** Arrastra el archivo del examen (formatos compatibles: MP3, M4A, AAC, WAV).
+3. **Calibración:** El sistema analizará la calidad y el volumen del audio automáticamente.
+4. **Generar Acta:** Pulsa el botón principal. El sistema identificará automáticamente los idiomas (Español + Lengua B) y transcribirá literalmente sin traducir ni corregir los errores del alumno.
 5. **Evaluación:**
-* Escucha el audio original.
-* Lee la transcripción (los errores gramaticales del alumno se mantienen intencionadamente).
-* Descarga el `.txt` final.
+   * Escucha el audio original con el reproductor integrado.
+   * Revisa la transcripción literal (organizada por códigos de tiempo e idioma).
+   * Descarga el archivo `.txt` con el acta oficial del examen.
 
 
 
